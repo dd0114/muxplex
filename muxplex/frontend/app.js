@@ -119,6 +119,9 @@ const MOBILE_THRESHOLD = 600;
 // ─── App state ────────────────────────────────────────────────────────────────
 let _deviceId = '';
 let _currentSessions = [];
+// Window-tree sidebar layer: map of sessionName -> [{index,name,active,task}].
+// Populated by pollSessions from GET /api/windows.
+let _windowsBySession = {};
 let _viewingSession = null;
 let _viewingRemoteId = '';
 let _viewMode = 'grid';
@@ -351,6 +354,14 @@ async function pollSessions() {
     const sessions = await res.json();
     const prev = _currentSessions;
     _currentSessions = sessions;
+    // Fetch the tmux window tree alongside sessions. Local-only endpoint;
+    // failures here must not break session polling, so swallow errors.
+    try {
+      const wres = await api('GET', '/api/windows');
+      _windowsBySession = await wres.json();
+    } catch (e) {
+      _windowsBySession = _windowsBySession || {};
+    }
     _pollFailCount = 0;
     setConnectionStatus('ok');
     renderGrid(sessions);
@@ -551,6 +562,84 @@ function buildTileHTML(session, index, mobile) {
 }
 
 /**
+ * Build a nested tree from a flat window list, splitting each window name on
+ * '/' so that "ws2/docs" nests "docs" under a "ws2" package segment.
+ *
+ * Returns a root node: { children: {seg: node}, order: [seg,...] }.
+ * A node with `.win` set corresponds to an actual tmux window (a leaf, though
+ * it may also have children if another window nests beneath its name).
+ * @param {object[]} windows - [{index,name,active,task}, ...]
+ */
+function buildWindowTree(windows) {
+  var root = { children: {}, order: [] };
+  (windows || []).forEach(function (w) {
+    var raw = String(w.name || '');
+    var segs = raw.split('/').filter(function (s) { return s.length > 0; });
+    if (segs.length === 0) segs = [raw];
+    var node = root;
+    segs.forEach(function (seg, i) {
+      if (!node.children[seg]) {
+        node.children[seg] = { seg: seg, children: {}, order: [], win: null };
+        node.order.push(seg);
+      }
+      node = node.children[seg];
+      if (i === segs.length - 1) node.win = w;
+    });
+  });
+  return root;
+}
+
+/**
+ * Recursively render a window-tree node to HTML. `depth` drives indentation
+ * via the --wt-depth CSS custom property.
+ */
+function renderWindowNode(node, depth) {
+  var html = '';
+  node.order.forEach(function (seg) {
+    var child = node.children[seg];
+    var hasChildren = child.order.length > 0;
+    var w = child.win;
+    var indent = ' style="--wt-depth:' + depth + '"';
+    if (w) {
+      var taskHtml = w.task
+        ? '<span class="wt-task">' + escapeHtml(w.task) + '</span>'
+        : '';
+      var activeCls = w.active ? ' wt-window--active' : '';
+      html +=
+        '<div class="wt-window' + activeCls + '"' + indent +
+        ' data-window-index="' + escapeHtml(String(w.index)) + '"' +
+        ' role="listitem" tabindex="0" title="' + escapeHtml(w.task || seg) + '">' +
+        '<span class="wt-name">' + escapeHtml(seg) + '</span>' + taskHtml +
+        '</div>';
+    } else {
+      html +=
+        '<div class="wt-folder"' + indent + '>' +
+        '<span class="wt-name">' + escapeHtml(seg) + '</span>' +
+        '</div>';
+    }
+    if (hasChildren) html += renderWindowNode(child, depth + 1);
+  });
+  return html;
+}
+
+/**
+ * Build the window-tree block for a session sidebar card, or '' if the session
+ * has no known windows. Windows come from _windowsBySession (GET /api/windows).
+ * @param {string} sessionName
+ */
+function buildWindowTreeHTML(sessionName) {
+  var wins = _windowsBySession && _windowsBySession[sessionName];
+  if (!wins || !wins.length) return '';
+  var root = buildWindowTree(wins);
+  return (
+    '<div class="sidebar-item-windows" data-window-tree="' +
+    escapeHtml(sessionName) + '">' +
+    renderWindowNode(root, 0) +
+    '</div>'
+  );
+}
+
+/**
  * Build the HTML string for a single session sidebar card.
  * @param {object} session
  * @param {string} currentSession - name of the currently active session
@@ -604,6 +693,9 @@ function buildSidebarHTML(session, currentSession, currentRemoteId) {
     `<button class="tile-options-btn" data-session="${escapedName}" aria-label="Session options" aria-haspopup="true">&#8942;</button>` +
     `</div>` +
     `<div class="sidebar-item-body"><pre>${ansiToHtml(lastLines)}</pre></div>` +
+    // Window-tree layer: only for local sessions (window data comes from the
+    // local tmux server). Remote/federated sessions have no entry and render ''.
+    (_sidebarEffRemoteId === '' ? buildWindowTreeHTML(name) : '') +
     `</article>`
   );
 }
@@ -898,7 +990,20 @@ function renderSidebar(sessions, currentSession, currentRemoteId) {
       const remoteId = item.dataset.remoteId || '';
       on(item, 'click', (e) => {
         if (e.target.closest && e.target.closest('.tile-options-btn')) return;
+        // Window clicks are handled by their own handler below.
+        if (e.target.closest && e.target.closest('.wt-window')) return;
         if (name !== currentSession || remoteId !== (currentRemoteId ?? '')) openSession(name, { remoteId });
+      });
+
+      // Window-tree: clicking a window opens the session and activates that
+      // tmux window via POST /api/sessions/{name}/select-window.
+      item.querySelectorAll('.wt-window').forEach((winEl) => {
+        on(winEl, 'click', (e) => {
+          e.stopPropagation();
+          const idx = parseInt(winEl.dataset.windowIndex, 10);
+          if (isNaN(idx)) return;
+          selectWindow(name, idx, remoteId);
+        });
       });
     });
   }
@@ -2976,6 +3081,38 @@ function updatePageTitle() {
  * @param {boolean} [opts.skipAnimation] - if true, skip the zoom animation (e.g. on page restore)
  * @returns {Promise<void>}
  */
+/**
+ * Activate a tmux window within a session, then ensure its terminal is shown.
+ *
+ * If the session is already open in fullscreen, the attached ttyd client
+ * follows the active-window change live, so we only POST select-window.
+ * Otherwise we open the session — the fresh ttyd attaches to the (now active)
+ * window. Local sessions only; window trees are not rendered for remote ones.
+ * @param {string} sessionName
+ * @param {number} index - tmux window index
+ * @param {string} remoteId
+ */
+async function selectWindow(sessionName, index, remoteId) {
+  remoteId = remoteId || '';
+  var alreadyOpen =
+    _viewingSession === sessionName &&
+    _viewMode === 'fullscreen' &&
+    (_viewingRemoteId || '') === remoteId;
+  try {
+    await api(
+      'POST',
+      '/api/sessions/' + encodeURIComponent(sessionName) + '/select-window',
+      { index: index }
+    );
+  } catch (err) {
+    showToast((err && err.message) || 'Failed to select window');
+    return;
+  }
+  if (!alreadyOpen) {
+    await openSession(sessionName, { remoteId: remoteId });
+  }
+}
+
 async function openSession(name, opts = {}) {
   if (!name || !name.trim()) return;
   hidePreview();

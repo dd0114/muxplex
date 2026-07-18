@@ -52,7 +52,9 @@ from muxplex.sessions import (
     enumerate_sessions,
     get_session_list,
     get_snapshots,
+    list_windows,
     run_tmux,
+    select_window,
     snapshot_all,
     update_session_cache,
 )
@@ -513,6 +515,10 @@ class CreateSessionPayload(BaseModel):
         return stripped
 
 
+class SelectWindowPayload(BaseModel):
+    index: int
+
+
 class SettingsSyncPayload(BaseModel):
     settings: dict
     settings_updated_at: float
@@ -597,6 +603,34 @@ async def get_sessions() -> list[dict]:
             }
         )
     return result
+
+
+@app.get("/api/windows")
+async def get_windows() -> dict[str, list[dict]]:
+    """Return all tmux windows grouped by session name (window-tree sidebar).
+
+    Each entry is {"index": int, "name": str, "active": bool, "task": str}.
+    Reuses the same tmux subprocess path as the rest of muxplex and is served
+    by the local viewer app (no new network surface).
+    """
+    return await list_windows()
+
+
+@app.post("/api/sessions/{name}/select-window")
+async def select_session_window(name: str, payload: SelectWindowPayload) -> dict:
+    """Activate a tmux window within *name* via ``tmux select-window``.
+
+    Raises HTTP 404 if the session is unknown (when the session list is
+    non-empty) or if tmux reports the target window does not exist.
+    """
+    known = get_session_list()
+    if known and name not in known:
+        raise HTTPException(status_code=404, detail=f"Session '{name}' not found")
+    try:
+        await select_window(name, payload.index)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"session": name, "index": payload.index, "ok": True}
 
 
 @app.post("/api/sessions")

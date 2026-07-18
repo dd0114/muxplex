@@ -163,6 +163,73 @@ async def capture_pane(session_name: str, lines: int = 30) -> str:
         return ""
 
 
+# ---------------------------------------------------------------------------
+# Window enumeration (window-tree sidebar layer)
+# ---------------------------------------------------------------------------
+
+# Field separator for `tmux list-windows -F`. A tab cannot appear in a tmux
+# window name, session name, or option value, so it is a safe delimiter.
+_WINDOW_FIELD_SEP = "\t"
+_WINDOW_FORMAT = _WINDOW_FIELD_SEP.join(
+    [
+        "#{session_name}",
+        "#{window_index}",
+        "#{window_name}",
+        "#{window_active}",
+        "#{@task}",  # user option; expands to '' when unset
+    ]
+)
+
+
+async def list_windows() -> dict[str, list[dict]]:
+    """Return all tmux windows grouped by session name.
+
+    Runs ``tmux list-windows -a -F <format>`` (one call, all sessions) and
+    parses each tab-delimited line into a dict:
+        {"index": int, "name": str, "active": bool, "task": str}
+
+    Returns {} if tmux is not running (RuntimeError/FileNotFoundError).
+    """
+    try:
+        output = await run_tmux("list-windows", "-a", "-F", _WINDOW_FORMAT)
+    except (RuntimeError, FileNotFoundError):
+        return {}
+
+    windows: dict[str, list[dict]] = {}
+    for line in output.splitlines():
+        if not line:
+            continue
+        # maxsplit keeps a @task value that itself contains tabs intact
+        # (tabs never appear in the leading fields).
+        parts = line.split(_WINDOW_FIELD_SEP, 4)
+        if len(parts) < 4:
+            continue
+        session_name, index_str, win_name, active_str = parts[:4]
+        task = parts[4] if len(parts) > 4 else ""
+        try:
+            index = int(index_str)
+        except ValueError:
+            continue
+        windows.setdefault(session_name, []).append(
+            {
+                "index": index,
+                "name": win_name,
+                "active": active_str == "1",
+                "task": task,
+            }
+        )
+    return windows
+
+
+async def select_window(session_name: str, index: int) -> None:
+    """Activate window *index* in *session_name* via ``tmux select-window``.
+
+    Reuses run_tmux, so it honors the configured socket dir. Raises
+    RuntimeError (from run_tmux) if the target does not exist.
+    """
+    await run_tmux("select-window", "-t", f"{session_name}:{index}")
+
+
 async def snapshot_all(names: list[str]) -> dict[str, str]:
     """Capture all sessions concurrently and return a name→text mapping.
 

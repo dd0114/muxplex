@@ -571,7 +571,7 @@ body {
    ============================================================ */
 
 .sidebar-item {
-  height: 120px;
+  min-height: 120px;       /* grows to fit the window-tree layer below the body */
   flex-shrink: 0;          /* prevent flex from compressing cards to fit */
   background: var(--bg-secondary);
   cursor: pointer;
@@ -630,10 +630,82 @@ body {
 }
 
 .sidebar-item-body {
-  flex: 1;
+  flex: 0 0 88px;          /* fixed preview area (was flex:1); tree sits below */
+  height: 88px;
   position: relative;
   overflow: hidden;
   background: #000000;
+}
+
+/* ---------------------------------------------------------------------------
+ * Window-tree layer — tmux windows of a session, rendered under the preview.
+ * Window names split on '/' nest as package segments; each window shows its
+ * @task option value as a dim label. Clicking a window activates it.
+ * ------------------------------------------------------------------------- */
+.sidebar-item-windows {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
+  padding: 3px 0;
+}
+
+.wt-folder,
+.wt-window {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  /* --wt-depth drives the package indent; base 8px + 12px per level */
+  padding: 2px 8px 2px calc(8px + var(--wt-depth, 0) * 12px);
+  font-size: 11px;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.wt-folder {
+  color: var(--text-muted);
+  font-weight: 600;
+  cursor: default;
+}
+
+.wt-folder .wt-name::before,
+.wt-window .wt-name::before {
+  content: '';
+}
+
+.wt-window {
+  color: var(--text);
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.wt-window:hover,
+.wt-window:focus-visible {
+  background: var(--bg-tile-hover);
+  outline: none;
+}
+
+.wt-window--active {
+  border-left-color: var(--accent);
+  background: var(--bg-surface);
+}
+
+.wt-window .wt-name {
+  color: var(--text);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.wt-window--active .wt-name {
+  color: var(--accent);
+}
+
+.wt-task {
+  color: var(--text-muted);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 
