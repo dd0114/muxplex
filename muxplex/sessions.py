@@ -177,8 +177,15 @@ _WINDOW_FORMAT = _WINDOW_FIELD_SEP.join(
         "#{window_name}",
         "#{window_active}",
         "#{@task}",  # user option; expands to '' when unset
+        "#{@fstate}",  # fleet live state; '' when unset (see FLEET_STATES)
     ]
 )
+
+# Recognized fleet activity states, set on the tmux ``@fstate`` window option by
+# the fleet-state hook (UserPromptSubmit→working, Stop→reply_ready,
+# Notification→needs_attention). Anything else (including '') is treated as idle
+# by the frontend. Kept here as the single source of truth for the vocabulary.
+FLEET_STATES = ("working", "reply_ready", "needs_attention", "stale")
 
 
 async def list_windows() -> dict[str, list[dict]]:
@@ -186,7 +193,12 @@ async def list_windows() -> dict[str, list[dict]]:
 
     Runs ``tmux list-windows -a -F <format>`` (one call, all sessions) and
     parses each tab-delimited line into a dict:
-        {"index": int, "name": str, "active": bool, "task": str}
+        {"index": int, "name": str, "active": bool, "task": str, "state": str}
+
+    ``state`` is the window's live ``@fstate`` fleet option (see FLEET_STATES);
+    '' when the hook has never fired for that window. Because it is read from
+    the live tmux server it is naturally scoped to windows that actually exist
+    (unlike the ~/.fleet/state/*.json files, which accumulate stale entries).
 
     Returns {} if tmux is not running (RuntimeError/FileNotFoundError).
     """
@@ -199,13 +211,16 @@ async def list_windows() -> dict[str, list[dict]]:
     for line in output.splitlines():
         if not line:
             continue
-        # maxsplit keeps a @task value that itself contains tabs intact
-        # (tabs never appear in the leading fields).
-        parts = line.split(_WINDOW_FIELD_SEP, 4)
+        # maxsplit-limited on the leading fixed fields; @task and @fstate are the
+        # trailing pair. @fstate is a controlled vocabulary with no tabs, so a
+        # final split on the last separator cleanly isolates it even if @task
+        # itself contained tabs.
+        parts = line.split(_WINDOW_FIELD_SEP, 5)
         if len(parts) < 4:
             continue
         session_name, index_str, win_name, active_str = parts[:4]
         task = parts[4] if len(parts) > 4 else ""
+        state = parts[5] if len(parts) > 5 else ""
         try:
             index = int(index_str)
         except ValueError:
@@ -216,6 +231,7 @@ async def list_windows() -> dict[str, list[dict]]:
                 "name": win_name,
                 "active": active_str == "1",
                 "task": task,
+                "state": state if state in FLEET_STATES else "",
             }
         )
     return windows

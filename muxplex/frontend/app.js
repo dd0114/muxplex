@@ -590,6 +590,57 @@ function buildWindowTree(windows) {
 }
 
 /**
+ * Map a window's fleet @fstate value to a CSS modifier class for its row.
+ * Unknown/empty states get no modifier (rendered as idle/dim).
+ * @param {string} state
+ */
+function stateModifierClass(state) {
+  switch (state) {
+    case 'working': return ' wt-window--working';
+    case 'reply_ready': return ' wt-window--reply';
+    case 'needs_attention': return ' wt-window--attention';
+    default: return '';
+  }
+}
+
+/**
+ * Human-readable label for a fleet state, used in the row title/tooltip and
+ * as the icon's aria-label. Returns '' for idle/unknown states.
+ * @param {string} state
+ */
+function stateAriaLabel(state) {
+  switch (state) {
+    case 'working': return 'generating';
+    case 'reply_ready': return 'reply ready';
+    case 'needs_attention': return 'needs attention';
+    default: return '';
+  }
+}
+
+/**
+ * Build the leading status-icon element for a window row. A spinning ring for
+ * `working`; a solid dot for `reply_ready` / `needs_attention`; a dim hollow
+ * dot for idle/unknown so every row stays vertically aligned.
+ * @param {string} state
+ */
+function buildStateIconHTML(state) {
+  var label = stateAriaLabel(state);
+  var aria = label
+    ? ' role="img" aria-label="' + escapeHtml(label) + '"'
+    : ' aria-hidden="true"';
+  if (state === 'working') {
+    return '<span class="wt-state wt-state--working"' + aria + '></span>';
+  }
+  if (state === 'reply_ready') {
+    return '<span class="wt-state wt-state--reply"' + aria + '></span>';
+  }
+  if (state === 'needs_attention') {
+    return '<span class="wt-state wt-state--attention"' + aria + '></span>';
+  }
+  return '<span class="wt-state wt-state--idle"' + aria + '></span>';
+}
+
+/**
  * Recursively render a window-tree node to HTML. `depth` drives indentation
  * via the --wt-depth CSS custom property.
  */
@@ -605,10 +656,16 @@ function renderWindowNode(node, depth) {
         ? '<span class="wt-task">' + escapeHtml(w.task) + '</span>'
         : '';
       var activeCls = w.active ? ' wt-window--active' : '';
+      var stateCls = stateModifierClass(w.state);
+      var titleText = w.task || seg;
+      var stateLabel = stateAriaLabel(w.state);
+      if (stateLabel) titleText += ' — ' + stateLabel;
       html +=
-        '<div class="wt-window' + activeCls + '"' + indent +
+        '<div class="wt-window' + activeCls + stateCls + '"' + indent +
         ' data-window-index="' + escapeHtml(String(w.index)) + '"' +
-        ' role="listitem" tabindex="0" title="' + escapeHtml(w.task || seg) + '">' +
+        ' data-state="' + escapeHtml(w.state || '') + '"' +
+        ' role="listitem" tabindex="0" title="' + escapeHtml(titleText) + '">' +
+        buildStateIconHTML(w.state) +
         '<span class="wt-name">' + escapeHtml(seg) + '</span>' + taskHtml +
         '</div>';
     } else {

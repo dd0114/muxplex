@@ -609,11 +609,32 @@ async def get_sessions() -> list[dict]:
 async def get_windows() -> dict[str, list[dict]]:
     """Return all tmux windows grouped by session name (window-tree sidebar).
 
-    Each entry is {"index": int, "name": str, "active": bool, "task": str}.
+    Each entry is {"index": int, "name": str, "active": bool, "task": str,
+    "state": str}. ``state`` is the window's live ``@fstate`` fleet option so
+    the sidebar can render a per-window activity icon (working / reply_ready /
+    needs_attention / idle).
+
     Reuses the same tmux subprocess path as the rest of muxplex and is served
     by the local viewer app (no new network surface).
+
+    Reinforcement: the ``@fstate`` option can go stale if the Stop hook was
+    missed (a window stuck showing ``working`` after it finished, or showing
+    ``reply_ready`` after a new generation started). muxplex already captures
+    each session's *active* pane into the snapshot cache, so when that snapshot
+    still shows tmux's live "esc to interrupt" affordance we force the active
+    window to ``working`` — a ground-truth signal that costs no extra tmux
+    calls. Non-active windows keep their reported ``@fstate``.
     """
-    return await list_windows()
+    windows = await list_windows()
+    snapshots = get_snapshots()
+    for session_name, wins in windows.items():
+        snap = snapshots.get(session_name, "")
+        if "esc to interrupt" not in snap:
+            continue
+        for w in wins:
+            if w.get("active"):
+                w["state"] = "working"
+    return windows
 
 
 @app.post("/api/sessions/{name}/select-window")

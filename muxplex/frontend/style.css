@@ -708,6 +708,65 @@ body {
   min-width: 0;
 }
 
+/* --- Per-window live status icon (fleet @fstate) --------------------------
+ * Leading 8px marker on every window row so the sidebar reads at a glance:
+ *   working  → spinning ring (answer generating)
+ *   reply    → solid green dot (reply arrived, waiting)
+ *   attention→ solid red dot (needs the human)
+ *   idle     → dim hollow dot (keeps rows aligned)
+ * ------------------------------------------------------------------------- */
+.wt-state {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  align-self: center;
+  box-sizing: border-box;
+}
+
+.wt-state--idle {
+  border: 1px solid var(--text-muted);
+  opacity: 0.35;
+}
+
+.wt-state--reply {
+  background: #2ecc71;
+  box-shadow: 0 0 4px rgba(46, 204, 113, 0.6);
+}
+
+.wt-state--attention {
+  background: #ff4d4f;
+  box-shadow: 0 0 5px rgba(255, 77, 79, 0.7);
+  animation: wt-attention-pulse 1.6s ease-in-out infinite;
+}
+
+.wt-state--working {
+  border: 1.5px solid var(--accent, #4aa3ff);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: wt-spin 0.7s linear infinite;
+  box-shadow: none;
+}
+
+/* Dim idle rows overall so active/attention rows stand out. */
+.wt-window[data-state=""] .wt-name,
+.wt-window[data-state=""] .wt-task {
+  opacity: 0.7;
+}
+
+.wt-window--attention .wt-name {
+  color: #ff7a7c;
+}
+
+@keyframes wt-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes wt-attention-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
 
 
 .sidebar-item-body pre {
@@ -1194,6 +1253,14 @@ body {
 
   .new-session-fab:active {
     transform: none;
+  }
+
+  .wt-state--working {
+    animation: none;
+  }
+
+  .wt-state--attention {
+    animation: none;
   }
 }
 
