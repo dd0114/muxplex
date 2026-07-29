@@ -1,19 +1,31 @@
 """
 Tests for the cache-busting version suffix on static asset URLs served by index_page().
 
-Verifies that GET / (the main dashboard) injects ?v=<version> on every
+Verifies that GET / (the main dashboard) injects ?v=<content-hash> on every
 <script src="…"> and <link href="…"> URL so browsers pick up new code
-immediately after each release, rather than serving stale JS/CSS from
-the HTTP cache.
+immediately whenever an asset's content changes — not only on a package
+version bump — rather than serving stale JS/CSS from the HTTP cache.
 """
 
+import hashlib
 import importlib.metadata
+import re
 
 import pytest
 from bs4 import BeautifulSoup
 from fastapi.testclient import TestClient
 
-from muxplex.main import app
+from muxplex.main import _FRONTEND_DIR, _UI_VERSION, _asset_version, app
+
+# Content-hash tokens are the first 12 hex chars of a sha256 digest.
+_HASH_RE = re.compile(r"^[0-9a-f]{12}$")
+
+
+def _query_token(url: str) -> str:
+    """Return the ?v=<token> value from a URL, or '' if absent."""
+    if "?v=" not in url:
+        return ""
+    return url.split("?v=", 1)[1]
 
 
 # ---------------------------------------------------------------------------
@@ -85,13 +97,12 @@ def _get_index_soup(client) -> BeautifulSoup:
 
 
 def test_index_all_asset_urls_have_version_suffix(client):
-    """GET / must inject ?v=<version> on every <script src> and <link href> asset URL.
+    """GET / must inject a ?v=<content-hash> token on every asset URL.
 
     Regression guard for the "is the user seeing stale JS?" investigation:
-    verifies that the standard HTTP cache is busted on every release by
-    appending a version query parameter to each static asset reference.
+    verifies that the standard HTTP cache is busted whenever an asset changes
+    by appending a content-hash query parameter to each static asset reference.
     """
-    version = importlib.metadata.version("muxplex")
     soup = _get_index_soup(client)
 
     # All <script src="…"> tags
@@ -100,18 +111,18 @@ def test_index_all_asset_urls_have_version_suffix(client):
         f"Expected at least 7 <script src> tags, found {len(script_tags)}"
     )
     for tag in script_tags:
-        src = tag["src"]
-        assert f"?v={version}" in src, (
-            f"<script src> missing ?v={version} suffix: {src!r}"
+        token = _query_token(tag["src"])
+        assert _HASH_RE.match(token), (
+            f"<script src> missing content-hash ?v= token: {tag['src']!r}"
         )
 
     # All <link href="…"> tags
     link_tags = soup.find_all("link", href=True)
     assert len(link_tags) >= 1, "Expected at least one <link href> tag"
     for tag in link_tags:
-        href = tag["href"]
-        assert f"?v={version}" in href, (
-            f"<link href> missing ?v={version} suffix: {href!r}"
+        token = _query_token(tag["href"])
+        assert _HASH_RE.match(token), (
+            f"<link href> missing content-hash ?v= token: {tag['href']!r}"
         )
 
 
@@ -121,30 +132,62 @@ def test_index_all_asset_urls_have_version_suffix(client):
 
 
 def test_index_vendor_scripts_each_versioned(client):
-    """All five vendor JS bundles must carry the version suffix, not just app.js.
+    """All five vendor JS bundles must carry a content-hash token, not just app.js.
 
     The browser-tester on spark-1 observed bare vendor URLs.  This test
     ensures that xterm.js and its addons are cache-busted alongside the
     first-party scripts.
     """
-    version = importlib.metadata.version("muxplex")
     soup = _get_index_soup(client)
 
     script_srcs = [tag["src"] for tag in soup.find_all("script", src=True)]
+    # Map bare path -> token for every versioned script.
+    by_path = {}
+    for src in script_srcs:
+        path = src.split("?v=", 1)[0]
+        by_path[path] = _query_token(src)
 
-    expected_versioned = [
-        f"/vendor/xterm.js?v={version}",
-        f"/vendor/xterm-addon-fit.js?v={version}",
-        f"/vendor/xterm-addon-web-links.js?v={version}",
-        f"/vendor/xterm-addon-search.js?v={version}",
-        f"/vendor/addon-image.js?v={version}",
-        f"/app.js?v={version}",
-        f"/terminal.js?v={version}",
+    expected_paths = [
+        "/vendor/xterm.js",
+        "/vendor/xterm-addon-fit.js",
+        "/vendor/xterm-addon-web-links.js",
+        "/vendor/xterm-addon-search.js",
+        "/vendor/addon-image.js",
+        "/app.js",
+        "/terminal.js",
     ]
-    for expected in expected_versioned:
-        assert expected in script_srcs, (
-            f"Expected versioned script {expected!r}; found srcs: {script_srcs}"
+    for path in expected_paths:
+        assert path in by_path, f"Expected script {path!r}; found srcs: {script_srcs}"
+        assert _HASH_RE.match(by_path[path]), (
+            f"Script {path!r} missing content-hash token: {by_path[path]!r}"
         )
+
+
+def test_asset_version_is_content_hash_and_distinct_per_file(client):
+    """_asset_version returns the sha256[:12] of the file content, so two files
+    with different content get different tokens and it is not the package version."""
+    from muxplex import main as main_mod
+
+    main_mod._ASSET_VERSION_CACHE.clear()
+
+    app_token = _asset_version("/app.js")
+    css_token = _asset_version("/style.css")
+
+    expected_app = hashlib.sha256((_FRONTEND_DIR / "app.js").read_bytes()).hexdigest()[:12]
+    assert app_token == expected_app, "app.js token must be sha256[:12] of its bytes"
+    assert app_token != css_token, "distinct files must get distinct cache-busting tokens"
+    # The whole point of the fix: the token is NOT the (static) package version.
+    assert app_token != _UI_VERSION
+
+
+def test_asset_version_falls_back_to_package_version_for_unresolvable(client):
+    """A URL that does not map to a real file under the frontend dir (incl. a
+    path-traversal attempt) falls back to the package version rather than 500."""
+    from muxplex import main as main_mod
+
+    main_mod._ASSET_VERSION_CACHE.clear()
+    assert _asset_version("/does-not-exist.js") == _UI_VERSION
+    assert _asset_version("/../../etc/passwd") == _UI_VERSION
 
 
 # ---------------------------------------------------------------------------
