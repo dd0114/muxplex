@@ -120,6 +120,9 @@ const MOBILE_THRESHOLD = 600;
 // ─── App state ────────────────────────────────────────────────────────────────
 let _deviceId = '';
 let _currentSessions = [];
+// Window-tree sidebar layer: map of sessionName -> [{index,name,active,task}].
+// Populated by pollSessions from GET /api/windows.
+let _windowsBySession = {};
 let _viewingSession = null;
 let _viewingRemoteId = '';
 let _viewMode = 'grid';
@@ -242,6 +245,45 @@ let _gridViewMode = 'flat';
 let _activeFilterDevice = 'all';
 let _activeView = 'all';
 let _localDeviceId = null;
+
+/**
+ * URL domain filter — parse a session name out of location.pathname.
+ *
+ * The server serves the dashboard index at GET /<session_name> for any live
+ * tmux session (see main.py session_domain_page). The frontend reads the
+ * pathname at load time: "/sidekick" → show only the "sidekick" session in
+ * the sidebar, tiles, and session lists; "/" (or /index.html) → no filter,
+ * full dashboard (no regression).
+ *
+ * Returns the decoded session name, or null when the path carries no domain
+ * (root, index.html, login, or any multi-segment path).
+ *
+ * @param {string} pathname - location.pathname
+ * @returns {string|null}
+ */
+function parseDomainFilter(pathname) {
+  var p = (pathname || '').replace(/\/+$/, '');  // tolerate trailing slash
+  if (p === '' || p === '/index.html' || p === '/login') return null;
+  var segs = p.split('/').filter(function (s) { return s.length > 0; });
+  if (segs.length !== 1) return null;
+  try {
+    return decodeURIComponent(segs[0]);
+  } catch (e) {
+    return segs[0];
+  }
+}
+
+// Hub session name — the control-surface tmux session that must stay
+// reachable from every domain view (/sidekick, /hmb, …). See #104.
+const HUB_SESSION_NAME = 'root';
+
+// Initialized once at load from the real browser location; null in the node
+// test environment (window.location stub has no pathname) and at "/".
+let _domainFilter =
+  (typeof window !== 'undefined' && window.location && window.location.pathname)
+    ? parseDomainFilter(window.location.pathname)
+    : null;
+
 // This server's own reported version (from /api/instance-info), for the
 // read-only "Version" field in Settings > Display. null until that fetch
 // resolves; never falls back to a guessed value.
@@ -332,6 +374,30 @@ function trackInteraction() {
  * Always resolves — errors are logged as warnings so the app can start normally.
  * @returns {Promise<void>}
  */
+/**
+ * Decide whether a server-side active_session should be reopened fullscreen
+ * on page load.  At a URL domain view (/<session_name>) only that session —
+ * or the hub session (HUB_SESSION_NAME), which is pinned into every domain
+ * view (#104) — may be restored; reopening any other session's terminal
+ * would contradict the "this page shows only <session_name>" semantics.
+ * At / (no domain filter) behavior is unchanged.
+ *
+ * @param {string|null} activeSession - state.active_session from the server
+ * @param {string|null} domainFilter - current _domainFilter (null at /)
+ * @returns {boolean}
+ */
+function shouldRestoreSession(activeSession, domainFilter) {
+  if (!activeSession) return false;
+  if (
+    domainFilter &&
+    activeSession !== domainFilter &&
+    activeSession !== HUB_SESSION_NAME
+  ) {
+    return false;
+  }
+  return true;
+}
+
 async function restoreState() {
   try {
     const res = await api('GET', '/api/state');
@@ -339,7 +405,7 @@ async function restoreState() {
     if (state.active_view) {
       _activeView = state.active_view;
     }
-    if (state.active_session) {
+    if (shouldRestoreSession(state.active_session, _domainFilter)) {
       await openSession(state.active_session, {
         skipAnimation: true,
         remoteId: state.active_remote_id || '',
@@ -391,6 +457,14 @@ async function pollSessions() {
     const sessions = await res.json();
     const prev = _currentSessions;
     _currentSessions = sessions;
+    // Fetch the tmux window tree alongside sessions. Local-only endpoint;
+    // failures here must not break session polling, so swallow errors.
+    try {
+      const wres = await api('GET', '/api/windows');
+      _windowsBySession = await wres.json();
+    } catch (e) {
+      _windowsBySession = _windowsBySession || {};
+    }
     _pollFailCount = 0;
     setConnectionStatus('ok');
     renderGrid(sessions);
@@ -760,6 +834,283 @@ function buildTileHTML(session, index, mobile) {
 }
 
 /**
+ * Build a nested tree from a flat window list.
+ *
+ * Two modes, chosen per session:
+ *  - Declared mode — used when ANY window carries a `parent` or `group`
+ *    declaration (tmux window options @parent/@group surfaced by
+ *    GET /api/windows). A window with `parent` nests under the window of that
+ *    name; windows sharing a `group` collect under a win-less folder node.
+ *    Root ordering: the `main` window first, then child-bearing roots, then
+ *    everything else (stable). Unknown-parent and cyclic-parent declarations
+ *    are demoted to root (defensive).
+ *  - Legacy mode — no declarations at all: split each window name on '/' so
+ *    "ws2/docs" nests "docs" under a "ws2" package segment (unchanged).
+ *
+ * Returns a root node: { children: {key: node}, order: [key,...] }.
+ * A node with `.win` set corresponds to an actual tmux window; a node with
+ * `.win === null` is a folder. `node.seg` is the display name.
+ * @param {object[]} windows - [{index,name,active,task,state,parent,group}, ...]
+ */
+function buildWindowTree(windows) {
+  var wins = windows || [];
+  var hasDeclarations = wins.some(function (w) {
+    return Boolean(w.parent) || Boolean(w.group);
+  });
+  if (!hasDeclarations) return buildNameSplitTree(wins);
+  return buildDeclaredTree(wins);
+}
+
+/**
+ * Legacy tree: split window names on '/' into package-like segments.
+ * @param {object[]} wins
+ */
+function buildNameSplitTree(wins) {
+  var root = { children: {}, order: [] };
+  wins.forEach(function (w) {
+    var raw = String(w.name || '');
+    var segs = raw.split('/').filter(function (s) { return s.length > 0; });
+    if (segs.length === 0) segs = [raw];
+    var node = root;
+    segs.forEach(function (seg, i) {
+      if (!node.children[seg]) {
+        node.children[seg] = { seg: seg, children: {}, order: [], win: null };
+        node.order.push(seg);
+      }
+      node = node.children[seg];
+      if (i === segs.length - 1) node.win = w;
+    });
+  });
+  promoteMainFirst(root);
+  return root;
+}
+
+/**
+ * Reorder a root node's children so the session's `main` window renders
+ * first (stable for everything else). Applied to legacy name-split trees;
+ * declared trees have their own three-way ranking that already puts main
+ * first. (#103 — main must sit at the very top of its session block.)
+ * @param {object} root
+ */
+function promoteMainFirst(root) {
+  var ranked = root.order.map(function (key, i) {
+    var n = root.children[key];
+    var pri = n.win && String(n.win.name || '') === 'main' ? 0 : 1;
+    return { key: key, pri: pri, i: i };
+  });
+  ranked.sort(function (a, b) { return (a.pri - b.pri) || (a.i - b.i); });
+  root.order = ranked.map(function (r) { return r.key; });
+}
+
+/**
+ * Declaration-based tree from @parent/@group window options.
+ * @param {object[]} wins
+ */
+function buildDeclaredTree(wins) {
+  var root = { children: {}, order: [] };
+  var byName = {};
+  var nodes = {};
+  wins.forEach(function (w) {
+    var name = String(w.name || '');
+    byName[name] = w;
+    nodes[name] = { seg: name, children: {}, order: [], win: w };
+  });
+
+  // Resolve a window's declared parent to an attachable window name, or null.
+  // null when: unset, self-reference, target doesn't exist, or the parent
+  // chain loops back (cycle) — all demote the window to root.
+  function resolvedParent(w) {
+    var name = String(w.name || '');
+    var p = String(w.parent || '');
+    if (!p || p === name || !byName[p]) return null;
+    var seen = {};
+    seen[name] = true;
+    var cur = p;
+    while (cur) {
+      if (seen[cur]) return null; // cycle
+      seen[cur] = true;
+      var next = String((byName[cur] && byName[cur].parent) || '');
+      if (!next || !byName[next]) break;
+      cur = next;
+    }
+    return p;
+  }
+
+  var groupFolders = {};
+  wins.forEach(function (w) {
+    var name = String(w.name || '');
+    var node = nodes[name];
+    var p = resolvedParent(w);
+    if (p) {
+      nodes[p].children[name] = node;
+      nodes[p].order.push(name);
+      return;
+    }
+    var g = String(w.group || '');
+    if (g) {
+      var folder = groupFolders[g];
+      if (!folder) {
+        folder = { seg: g, children: {}, order: [], win: null };
+        groupFolders[g] = folder;
+        // Key namespaced so a window named like the group can't collide.
+        var key = 'group:' + g;
+        root.children[key] = folder;
+        root.order.push(key);
+      }
+      folder.children[name] = node;
+      folder.order.push(name);
+      return;
+    }
+    root.children[name] = node;
+    root.order.push(name);
+  });
+
+  // Root ordering: main first, then child-bearing nodes, then leaves (stable).
+  var ranked = root.order.map(function (key, i) {
+    var n = root.children[key];
+    var pri = n.win && String(n.win.name || '') === 'main'
+      ? 0
+      : (n.order.length > 0 ? 1 : 2);
+    return { key: key, pri: pri, i: i };
+  });
+  ranked.sort(function (a, b) { return (a.pri - b.pri) || (a.i - b.i); });
+  root.order = ranked.map(function (r) { return r.key; });
+  return root;
+}
+
+/**
+ * Map a window's fleet @fstate value to a CSS modifier class for its row.
+ * Unknown/empty states get no modifier (rendered as idle/dim).
+ * @param {string} state
+ */
+function stateModifierClass(state) {
+  switch (state) {
+    case 'working': return ' wt-window--working';
+    case 'reply_ready': return ' wt-window--reply';
+    case 'needs_attention': return ' wt-window--attention';
+    default: return '';
+  }
+}
+
+/**
+ * Human-readable label for a fleet state, used in the row title/tooltip and
+ * as the icon's aria-label. Returns '' for idle/unknown states.
+ * @param {string} state
+ */
+function stateAriaLabel(state) {
+  switch (state) {
+    case 'working': return 'generating';
+    case 'reply_ready': return 'reply ready';
+    case 'needs_attention': return 'needs attention';
+    default: return '';
+  }
+}
+
+/**
+ * Build the leading status-icon element for a window row. A spinning ring for
+ * `working`; a solid dot for `reply_ready` / `needs_attention`; a dim hollow
+ * dot for idle/unknown so every row stays vertically aligned.
+ * @param {string} state
+ */
+function buildStateIconHTML(state) {
+  var label = stateAriaLabel(state);
+  var aria = label
+    ? ' role="img" aria-label="' + escapeHtml(label) + '"'
+    : ' aria-hidden="true"';
+  if (state === 'working') {
+    return '<span class="wt-state wt-state--working"' + aria + '></span>';
+  }
+  if (state === 'reply_ready') {
+    return '<span class="wt-state wt-state--reply"' + aria + '></span>';
+  }
+  if (state === 'needs_attention') {
+    return '<span class="wt-state wt-state--attention"' + aria + '></span>';
+  }
+  return '<span class="wt-state wt-state--idle"' + aria + '></span>';
+}
+
+/**
+ * Recursively render a window-tree node to HTML. `depth` drives indentation
+ * via the --wt-depth CSS custom property.
+ *
+ * Visual hierarchy (#103):
+ *  - When the root level contains a `main` window, main stays pinned at
+ *    depth 0 and every other root row is demoted one level, so the
+ *    main ↔ worker relationship is visible even for flat window lists.
+ *    Sessions without a root `main` window are rendered unchanged.
+ *  - main gets the `wt-window--main` modifier (bold/bigger styling).
+ *  - Every row at depth ≥ 1 gets a leading `.wt-connector` elbow so the
+ *    tree structure reads as explicit guide lines, not just whitespace.
+ */
+function renderWindowNode(node, depth) {
+  var isRootLevel = depth === 0;
+  var hasRootMain = isRootLevel && node.order.some(function (key) {
+    var n = node.children[key];
+    return Boolean(n.win) && String(n.win.name || '') === 'main';
+  });
+  var html = '';
+  node.order.forEach(function (seg) {
+    var child = node.children[seg];
+    var hasChildren = child.order.length > 0;
+    var w = child.win;
+    // Display name: node.seg when present (declared-mode folder keys are
+    // namespaced, e.g. 'group:onboard'); fall back to the map key.
+    var label = child.seg || seg;
+    var isMain = isRootLevel && Boolean(w) && String(w.name || '') === 'main';
+    var rowDepth = (hasRootMain && !isMain) ? depth + 1 : depth;
+    var indent = ' style="--wt-depth:' + rowDepth + '"';
+    var connector = rowDepth > 0
+      ? '<span class="wt-connector" aria-hidden="true"></span>'
+      : '';
+    if (w) {
+      var taskHtml = w.task
+        ? '<span class="wt-task">' + escapeHtml(w.task) + '</span>'
+        : '';
+      var activeCls = w.active ? ' wt-window--active' : '';
+      var stateCls = stateModifierClass(w.state);
+      var mainCls = isMain ? ' wt-window--main' : '';
+      var titleText = w.task || label;
+      var stateLabel = stateAriaLabel(w.state);
+      if (stateLabel) titleText += ' — ' + stateLabel;
+      html +=
+        '<div class="wt-window' + activeCls + stateCls + mainCls + '"' + indent +
+        ' data-window-index="' + escapeHtml(String(w.index)) + '"' +
+        ' data-state="' + escapeHtml(w.state || '') + '"' +
+        ' role="listitem" tabindex="0" title="' + escapeHtml(titleText) + '">' +
+        connector +
+        buildStateIconHTML(w.state) +
+        '<span class="wt-name">' + escapeHtml(label) + '</span>' + taskHtml +
+        '</div>';
+    } else {
+      html +=
+        '<div class="wt-folder"' + indent + '>' +
+        connector +
+        '<span class="wt-name">' + escapeHtml(label) + '</span>' +
+        '</div>';
+    }
+    if (hasChildren) html += renderWindowNode(child, rowDepth + 1);
+  });
+  return html;
+}
+
+/**
+ * Build the window-tree block for a session sidebar card, or '' if the session
+ * has no known windows. Windows come from _windowsBySession (GET /api/windows).
+ * @param {string} sessionName
+ */
+function buildWindowTreeHTML(sessionName) {
+  var wins = _windowsBySession && _windowsBySession[sessionName];
+  if (!wins || !wins.length) return '';
+  var root = buildWindowTree(wins);
+  return (
+    '<div class="sidebar-item-windows" data-window-tree="' +
+    escapeHtml(sessionName) + '">' +
+    renderWindowNode(root, 0) +
+    '</div>'
+  );
+}
+
+/**
  * Build the HTML string for a single session sidebar card.
  * @param {object} session
  * @param {string} currentSession - name of the currently active session
@@ -813,6 +1164,9 @@ function buildSidebarHTML(session, currentSession, currentRemoteId) {
     `<button class="tile-options-btn" data-session="${escapedName}" aria-label="Session options" aria-haspopup="true">&#8942;</button>` +
     `</div>` +
     `<div class="sidebar-item-body"><pre>${ansiToHtml(lastLines)}</pre></div>` +
+    // Window-tree layer: only for local sessions (window data comes from the
+    // local tmux server). Remote/federated sessions have no entry and render ''.
+    (_sidebarEffRemoteId === '' ? buildWindowTreeHTML(name) : '') +
     `</article>`
   );
 }
@@ -902,6 +1256,24 @@ function visibleCount(sessions, settings, view, options) {
  * @returns {object[]}
  */
 function getVisibleSessions(sessions) {
+  if (_domainFilter) {
+    // URL domain view (/<session_name>): deterministic URL semantics beat
+    // saved view membership and hidden state — filter the *live* session list
+    // (includeHidden, view "all") down to the named session. Status
+    // entries (unreachable/auth_failed devices) are still excluded by
+    // filterVisible's live-only pass.
+    //
+    // The hub session (HUB_SESSION_NAME) is pinned into every domain view
+    // (#104): the operator must always be able to reach the hub from
+    // /sidekick, /hmb, … Ordering is deterministic — domain session first,
+    // hub after it.
+    var live = filterVisible(sessions, _serverSettings, 'all', { includeHidden: true });
+    var domain = live.filter(function (s) { return s.name === _domainFilter; });
+    var hub = _domainFilter === HUB_SESSION_NAME
+      ? []
+      : live.filter(function (s) { return s.name === HUB_SESSION_NAME; });
+    return domain.concat(hub);
+  }
   return filterVisible(sessions, _serverSettings, _activeView);
 }
 
@@ -1110,7 +1482,20 @@ function renderSidebar(sessions, currentSession, currentRemoteId) {
       const remoteId = item.dataset.remoteId || '';
       on(item, 'click', (e) => {
         if (e.target.closest && e.target.closest('.tile-options-btn')) return;
+        // Window clicks are handled by their own handler below.
+        if (e.target.closest && e.target.closest('.wt-window')) return;
         if (name !== currentSession || remoteId !== (currentRemoteId ?? '')) openSession(name, { remoteId });
+      });
+
+      // Window-tree: clicking a window opens the session and activates that
+      // tmux window via POST /api/sessions/{name}/select-window.
+      item.querySelectorAll('.wt-window').forEach((winEl) => {
+        on(winEl, 'click', (e) => {
+          e.stopPropagation();
+          const idx = parseInt(winEl.dataset.windowIndex, 10);
+          if (isNaN(idx)) return;
+          selectWindow(name, idx, remoteId);
+        });
       });
     });
   }
@@ -3201,7 +3586,9 @@ function updatePageTitle() {
     return s.bell && s.bell.unseen_count > 0;
   }).length;
   var prefix = count > 0 ? '(' + count + ') ' : '';
-  document.title = prefix + hostname + ' - muxplex';
+  // Domain view indicator: "/sidekick" shows as "sidekick @ host - muxplex".
+  var domain = _domainFilter ? _domainFilter + ' @ ' : '';
+  document.title = prefix + domain + hostname + ' - muxplex';
 }
 
 // ─── Session open / close ────────────────────────────────────────────────────
@@ -3213,6 +3600,38 @@ function updatePageTitle() {
  * @param {boolean} [opts.skipAnimation] - if true, skip the zoom animation (e.g. on page restore)
  * @returns {Promise<void>}
  */
+/**
+ * Activate a tmux window within a session, then ensure its terminal is shown.
+ *
+ * If the session is already open in fullscreen, the attached ttyd client
+ * follows the active-window change live, so we only POST select-window.
+ * Otherwise we open the session — the fresh ttyd attaches to the (now active)
+ * window. Local sessions only; window trees are not rendered for remote ones.
+ * @param {string} sessionName
+ * @param {number} index - tmux window index
+ * @param {string} remoteId
+ */
+async function selectWindow(sessionName, index, remoteId) {
+  remoteId = remoteId || '';
+  var alreadyOpen =
+    _viewingSession === sessionName &&
+    _viewMode === 'fullscreen' &&
+    (_viewingRemoteId || '') === remoteId;
+  try {
+    await api(
+      'POST',
+      '/api/sessions/' + encodeURIComponent(sessionName) + '/select-window',
+      { index: index }
+    );
+  } catch (err) {
+    showToast((err && err.message) || 'Failed to select window');
+    return;
+  }
+  if (!alreadyOpen) {
+    await openSession(sessionName, { remoteId: remoteId });
+  }
+}
+
 async function openSession(name, opts = {}) {
   if (!name || !name.trim()) return;
   // A LOCAL switch (as opposed to adopting a value the server already told us
@@ -4910,6 +5329,12 @@ function _setActiveFilterDevice(device) {
 /** Test-only: get current _activeView value. */
 function _getActiveView() { return _activeView; }
 
+/** Test-only: set _domainFilter directly. */
+function _setDomainFilter(name) { _domainFilter = name; }
+
+/** Test-only: get current _domainFilter value. */
+function _getDomainFilter() { return _domainFilter; }
+
 /** Test-only: set _activeView directly. */
 function _setActiveView(view) { _activeView = view; }
 
@@ -5029,6 +5454,12 @@ if (typeof module !== 'undefined' && module.exports) {
     updateSessionPill,
     updatePageTitle,
     updateFaviconBadge,
+    // Window-tree sidebar (declaration-based hierarchy)
+    buildWindowTree,
+    renderWindowNode,
+    buildWindowTreeHTML,
+    promoteMainFirst,
+    HUB_SESSION_NAME,
     // ANSI color rendering
     ansiToHtml,
     ansiParamsToStyle,
@@ -5089,6 +5520,9 @@ if (typeof module !== 'undefined' && module.exports) {
     isHidden,
     filterVisible,
     visibleCount,
+    // URL domain filter (/<session_name>)
+    parseDomainFilter,
+    shouldRestoreSession,
     // Operation layer (Phase 2) — pure data ops
     _opAddMembership,
     _opRemoveMembership,
@@ -5116,5 +5550,7 @@ if (typeof module !== 'undefined' && module.exports) {
     _setActiveFilterDevice,
     _getActiveView,
     _setActiveView,
+    _setDomainFilter,
+    _getDomainFilter,
   };
 }

@@ -6238,6 +6238,308 @@ test('v0.6.3: empty-state still appears when every device has zero visible sessi
   app._setActiveView('all');
 });
 
+// ---------------------------------------------------------------------------
+// buildWindowTree — declaration-based hierarchy (@parent / @group)
+// ---------------------------------------------------------------------------
+
+test('buildWindowTree nests a @parent-declared window under its parent', () => {
+  const wins = [
+    { index: 0, name: 'rbi-finish', active: true, task: '', state: '', parent: '', group: '' },
+    { index: 1, name: 'rbi-a3', active: false, task: '', state: '', parent: 'rbi-finish', group: '' },
+    { index: 2, name: 'rbi-b3x', active: false, task: '', state: '', parent: 'rbi-finish', group: '' },
+  ];
+  const root = app.buildWindowTree(wins);
+  const parent = root.children['rbi-finish'];
+  assert.ok(parent, 'parent window should be a root node');
+  assert.ok(parent.win, 'parent node should carry its window');
+  assert.ok(parent.children['rbi-a3'], 'rbi-a3 should nest under rbi-finish');
+  assert.equal(parent.children['rbi-a3'].win.index, 1);
+  assert.ok(parent.children['rbi-b3x'], 'rbi-b3x should nest under rbi-finish');
+  assert.equal(root.order.length, 1, 'children must not also appear at root');
+});
+
+test('buildWindowTree collects same-@group windows under a group folder', () => {
+  const wins = [
+    { index: 0, name: 'main', active: true, task: '', state: '', parent: '', group: '' },
+    { index: 1, name: 'room-onboard', active: false, task: '', state: '', parent: '', group: 'onboard' },
+    { index: 2, name: 'onboard-api', active: false, task: '', state: '', parent: '', group: 'onboard' },
+  ];
+  const root = app.buildWindowTree(wins);
+  const folderKey = root.order.find((k) => root.children[k].win === null);
+  assert.ok(folderKey, 'a win-less folder node should exist at root');
+  const folder = root.children[folderKey];
+  assert.equal(folder.seg, 'onboard', 'folder displays the group name');
+  assert.ok(folder.children['room-onboard'], 'room-onboard under group folder');
+  assert.ok(folder.children['onboard-api'], 'onboard-api under group folder');
+});
+
+test('buildWindowTree sorts main window to the top in declared mode', () => {
+  const wins = [
+    { index: 0, name: 'zeta', active: false, task: '', state: '', parent: '', group: 'g1' },
+    { index: 1, name: 'alpha', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 2, name: 'main', active: true, task: '', state: '', parent: '', group: '' },
+  ];
+  const root = app.buildWindowTree(wins);
+  assert.equal(root.order[0], 'main', 'main window sorts first at root');
+});
+
+test('buildWindowTree sorts child-bearing roots above plain leaves in declared mode', () => {
+  const wins = [
+    { index: 0, name: 'loner', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 1, name: 'hub', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 2, name: 'spoke', active: false, task: '', state: '', parent: 'hub', group: '' },
+  ];
+  const root = app.buildWindowTree(wins);
+  assert.ok(root.order.indexOf('hub') < root.order.indexOf('loner'),
+    'root with children sorts above childless leaf');
+});
+
+test('buildWindowTree keeps legacy name-split tree when no declarations exist', () => {
+  const wins = [
+    { index: 0, name: 'ws2/docs', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 1, name: 'ws2/api', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 2, name: 'main', active: true, task: '', state: '', parent: '', group: '' },
+  ];
+  const root = app.buildWindowTree(wins);
+  // #103: main is promoted to the top even in legacy mode; the rest keeps
+  // its insertion order.
+  assert.deepEqual(root.order, ['main', 'ws2'], 'main first, rest stable');
+  assert.ok(root.children['ws2'].children['docs'], 'name-split nesting intact');
+  assert.equal(root.children['ws2'].children['api'].win.index, 1);
+});
+
+test('buildWindowTree keeps legacy tree for windows missing parent/group keys entirely', () => {
+  const wins = [
+    { index: 0, name: 'a/b', active: false, task: '', state: '' },
+    { index: 1, name: 'plain', active: false, task: '', state: '' },
+  ];
+  const root = app.buildWindowTree(wins);
+  assert.ok(root.children['a'].children['b'], 'old API shape falls back to name-split');
+});
+
+test('buildWindowTree demotes unknown-parent and cyclic-parent windows to root', () => {
+  const wins = [
+    { index: 0, name: 'orphan', active: false, task: '', state: '', parent: 'ghost', group: '' },
+    { index: 1, name: 'cyc-a', active: false, task: '', state: '', parent: 'cyc-b', group: '' },
+    { index: 2, name: 'cyc-b', active: false, task: '', state: '', parent: 'cyc-a', group: '' },
+  ];
+  const root = app.buildWindowTree(wins);
+  assert.ok(root.children['orphan'], 'unknown parent demoted to root');
+  assert.ok(root.children['cyc-a'], 'cycle member a demoted to root');
+  assert.ok(root.children['cyc-b'], 'cycle member b demoted to root');
+  assert.equal(root.children['cyc-a'].order.length, 0, 'no nesting inside a cycle');
+});
+
+test('renderWindowNode renders a group folder with wt-folder and nested windows deeper', () => {
+  const wins = [
+    { index: 1, name: 'room-onboard', active: false, task: '', state: '', parent: '', group: 'onboard' },
+    { index: 2, name: 'onboard-api', active: false, task: '', state: '', parent: '', group: 'onboard' },
+  ];
+  const root = app.buildWindowTree(wins);
+  const html = app.renderWindowNode(root, 0);
+  assert.ok(html.includes('wt-folder'), 'group renders as a folder row');
+  assert.ok(html.includes('onboard'), 'folder shows group name');
+  assert.ok(html.includes('--wt-depth:1'), 'group members indent one level deeper');
+});
+
+// ─── URL domain filter (/<session_name>) ─────────────────────────────────────
+
+test('parseDomainFilter returns null for / and /index.html and /login', () => {
+  assert.strictEqual(app.parseDomainFilter('/'), null);
+  assert.strictEqual(app.parseDomainFilter(''), null);
+  assert.strictEqual(app.parseDomainFilter('/index.html'), null);
+  assert.strictEqual(app.parseDomainFilter('/login'), null);
+});
+
+test('parseDomainFilter extracts a single-segment session name', () => {
+  assert.strictEqual(app.parseDomainFilter('/sidekick'), 'sidekick');
+  assert.strictEqual(app.parseDomainFilter('/hmb'), 'hmb');
+  assert.strictEqual(app.parseDomainFilter('/sidekick/'), 'sidekick', 'trailing slash tolerated');
+});
+
+test('parseDomainFilter decodes percent-encoded names and rejects multi-segment paths', () => {
+  assert.strictEqual(app.parseDomainFilter('/my%20session'), 'my session');
+  assert.strictEqual(app.parseDomainFilter('/vendor/xterm.js'), null, 'multi-segment is not a domain');
+});
+
+test('getVisibleSessions with a domain filter returns only that session', () => {
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  app._setDomainFilter('sidekick');
+  const sessions = [
+    { name: 'sidekick', snapshot: '' },
+    { name: 'hmb', snapshot: '' },
+    { name: 'spider', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.strictEqual(result.length, 1, 'only the domain session survives the filter');
+  assert.strictEqual(result[0].name, 'sidekick');
+  app._setDomainFilter(null);
+});
+
+test('getVisibleSessions with domain filter overrides view membership and hidden state', () => {
+  // /sidekick must show sidekick even if the active view excludes it or it is hidden —
+  // deterministic URL semantics beat saved view state.
+  app._setServerSettings({
+    hidden_sessions: ['sidekick'],
+    views: [{ name: 'work', sessions: ['hmb'] }],
+  });
+  app._setActiveView('work');
+  app._setDomainFilter('sidekick');
+  const sessions = [
+    { name: 'sidekick', snapshot: '' },
+    { name: 'hmb', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.strictEqual(result.length, 1);
+  assert.strictEqual(result[0].name, 'sidekick');
+  app._setDomainFilter(null);
+  app._setServerSettings(null);
+  app._setActiveView('all');
+});
+
+test('getVisibleSessions without domain filter keeps full list (no regression at /)', () => {
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  app._setDomainFilter(null);
+  const sessions = [
+    { name: 'sidekick', snapshot: '' },
+    { name: 'hmb', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.strictEqual(result.length, 2, 'all sessions visible at /');
+});
+
+test('domain filter still excludes status entries (unreachable devices)', () => {
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  app._setDomainFilter('sidekick');
+  const sessions = [
+    { name: 'sidekick', snapshot: '' },
+    { status: 'unreachable', deviceName: 'gone-box' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.strictEqual(result.length, 1);
+  assert.strictEqual(result[0].name, 'sidekick');
+  app._setDomainFilter(null);
+});
+
+test('getVisibleSessions pins the hub session into every domain view (#104)', () => {
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  app._setDomainFilter('sidekick');
+  const sessions = [
+    { name: 'hmb', snapshot: '' },
+    { name: 'root', snapshot: '' },
+    { name: 'sidekick', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.deepStrictEqual(
+    result.map((s) => s.name),
+    ['sidekick', 'root'],
+    'domain session first, hub session pinned after it',
+  );
+  app._setDomainFilter(null);
+});
+
+test('getVisibleSessions at /root shows the hub exactly once (#104)', () => {
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  app._setDomainFilter('root');
+  const sessions = [
+    { name: 'root', snapshot: '' },
+    { name: 'sidekick', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.deepStrictEqual(result.map((s) => s.name), ['root'], 'no duplicate hub entry');
+  app._setDomainFilter(null);
+});
+
+test('getVisibleSessions domain view shows hub even when hidden (#104)', () => {
+  app._setServerSettings({ hidden_sessions: ['root'], views: [] });
+  app._setActiveView('all');
+  app._setDomainFilter('hmb');
+  const sessions = [
+    { name: 'hmb', snapshot: '' },
+    { name: 'root', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.deepStrictEqual(result.map((s) => s.name), ['hmb', 'root']);
+  app._setDomainFilter(null);
+  app._setServerSettings(null);
+});
+
+// ─── Window-tree visual hierarchy — main pinned, workers demoted (#103) ──────
+
+test('renderWindowNode pins main at depth 0 and demotes sibling workers to depth 1 (#103)', () => {
+  const wins = [
+    { index: 1, name: 'main', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 2, name: 'workerA', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 3, name: 'workerB', active: false, task: '', state: '', parent: '', group: '' },
+  ];
+  const html = app.renderWindowNode(app.buildWindowTree(wins), 0);
+  const mainRow = html.match(/<div class="wt-window[^"]*wt-window--main[^"]*"[^>]*>/);
+  assert.ok(mainRow, 'main row carries the wt-window--main modifier');
+  assert.ok(mainRow[0].includes('--wt-depth:0'), 'main stays at depth 0');
+  const workerRows = html.match(/--wt-depth:1/g) || [];
+  assert.strictEqual(workerRows.length, 2, 'both sibling workers demoted to depth 1');
+  assert.ok(html.includes('wt-connector'), 'demoted rows draw a tree connector');
+});
+
+test('renderWindowNode nests declared children one level under demoted workers (#103)', () => {
+  const wins = [
+    { index: 1, name: 'main', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 2, name: 'boss', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 3, name: 'sub', active: false, task: '', state: '', parent: 'boss', group: '' },
+  ];
+  const html = app.renderWindowNode(app.buildWindowTree(wins), 0);
+  assert.ok(html.includes('--wt-depth:0'), 'main at depth 0');
+  assert.ok(html.includes('--wt-depth:1'), 'boss demoted to depth 1');
+  assert.ok(html.includes('--wt-depth:2'), 'declared child sits at depth 2');
+});
+
+test('renderWindowNode leaves sessions without a root main window undemoted (#103)', () => {
+  const wins = [
+    { index: 1, name: 'hub', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 2, name: 'audit', active: false, task: '', state: '', parent: '', group: '' },
+  ];
+  const html = app.renderWindowNode(app.buildWindowTree(wins), 0);
+  assert.ok(!html.includes('--wt-depth:1'), 'no demotion without a main window');
+  assert.ok(!html.includes('wt-window--main'), 'no main modifier');
+  assert.ok(!html.includes('wt-connector'), 'no connectors at depth 0');
+});
+
+test('buildWindowTree orders main first in legacy name-split mode (#103)', () => {
+  const wins = [
+    { index: 1, name: 'home', active: false },
+    { index: 2, name: 'main', active: false },
+  ];
+  const root = app.buildWindowTree(wins);
+  assert.strictEqual(root.order[0], 'main', 'main promoted to the top');
+  assert.strictEqual(root.order[1], 'home');
+});
+
+test('shouldRestoreSession blocks restoring a non-domain, non-hub session at /<session>', () => {
+  // At /sidekick, a server-side active_session of "hmb" must NOT reopen
+  // fullscreen — the domain view shows only its own session (plus the hub).
+  assert.strictEqual(app.shouldRestoreSession('hmb', 'sidekick'), false);
+  assert.strictEqual(app.shouldRestoreSession('sidekick', 'sidekick'), true);
+});
+
+test('shouldRestoreSession allows restoring the hub session at a domain view (#104)', () => {
+  // The hub session is pinned into every domain view, so a server-side
+  // active_session of "root" may legitimately reopen fullscreen there.
+  assert.strictEqual(app.HUB_SESSION_NAME, 'root');
+  assert.strictEqual(app.shouldRestoreSession('root', 'sidekick'), true);
+  assert.strictEqual(app.shouldRestoreSession('root', 'hmb'), true);
+});
+
+test('shouldRestoreSession keeps full restore behavior at / (no regression)', () => {
+  assert.strictEqual(app.shouldRestoreSession('root', null), true);
+  assert.strictEqual(app.shouldRestoreSession(null, null), false);
+  assert.strictEqual(app.shouldRestoreSession(null, 'sidekick'), false);
+});
+
 // --- followRemoteActiveSession (PWA follows external session switch) ---
 // active_session is server-global; when another device (Stream Deck, agent)
 // switches it via POST /connect, the poll loop must detect the change and

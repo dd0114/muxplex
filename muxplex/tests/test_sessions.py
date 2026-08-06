@@ -18,6 +18,7 @@ from muxplex.sessions import (
     get_snapshots,
     get_session_activity,
     get_session_list,
+    list_windows,
     run_tmux,
     snapshot_all,
     tmux_env,
@@ -497,3 +498,69 @@ def test_update_session_cache_empty_names_clears_caches():
 
     assert get_session_list() == []
     assert get_snapshots() == {}
+
+
+# ---------------------------------------------------------------------------
+# list_windows tests (window-tree sidebar + live @fstate status)
+# ---------------------------------------------------------------------------
+
+TAB = "\t"
+
+
+async def test_list_windows_parses_fstate_into_state_field(mock_subprocess):
+    """Each window dict carries the live @fstate value in a 'state' key."""
+    line1 = TAB.join(["hmb", "0", "main", "1", "ship it", "working"])
+    line2 = TAB.join(["hmb", "1", "deploy", "0", "", "reply_ready"])
+    with mock_subprocess(stdout=line1 + "\n" + line2 + "\n"):
+        windows = await list_windows()
+
+    assert windows["hmb"][0] == {
+        "index": 0,
+        "name": "main",
+        "active": True,
+        "task": "ship it",
+        "state": "working",
+        "parent": "",
+        "group": "",
+    }
+    assert windows["hmb"][1]["state"] == "reply_ready"
+
+
+async def test_list_windows_unknown_fstate_normalized_to_empty(mock_subprocess):
+    """An unrecognized @fstate value is coerced to '' (rendered as idle)."""
+    line = TAB.join(["s", "0", "w", "1", "", "bogus"])
+    with mock_subprocess(stdout=line + "\n"):
+        windows = await list_windows()
+    assert windows["s"][0]["state"] == ""
+
+
+async def test_list_windows_missing_fstate_field_defaults_empty(mock_subprocess):
+    """A window with no @task/@fstate columns still parses with state=''."""
+    line = TAB.join(["s", "0", "w", "1"])
+    with mock_subprocess(stdout=line + "\n"):
+        windows = await list_windows()
+    assert windows["s"][0]["state"] == ""
+    assert windows["s"][0]["task"] == ""
+
+
+async def test_list_windows_parses_parent_and_group_fields(mock_subprocess):
+    """Each window dict carries @parent/@group declarations for the tree view."""
+    line1 = TAB.join(["sidekick", "0", "rbi-finish", "1", "", "working", "", ""])
+    line2 = TAB.join(["sidekick", "1", "rbi-a3", "0", "", "", "rbi-finish", ""])
+    line3 = TAB.join(["sidekick", "2", "room-onboard", "0", "", "", "", "onboard"])
+    with mock_subprocess(stdout="\n".join([line1, line2, line3]) + "\n"):
+        windows = await list_windows()
+
+    assert windows["sidekick"][0]["parent"] == ""
+    assert windows["sidekick"][0]["group"] == ""
+    assert windows["sidekick"][1]["parent"] == "rbi-finish"
+    assert windows["sidekick"][2]["group"] == "onboard"
+
+
+async def test_list_windows_missing_parent_group_fields_default_empty(mock_subprocess):
+    """A short line (older tmux output shape) still parses with parent/group=''."""
+    line = TAB.join(["s", "0", "w", "1"])
+    with mock_subprocess(stdout=line + "\n"):
+        windows = await list_windows()
+    assert windows["s"][0]["parent"] == ""
+    assert windows["s"][0]["group"] == ""

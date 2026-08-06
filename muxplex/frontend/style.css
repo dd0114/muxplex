@@ -571,7 +571,7 @@ body {
    ============================================================ */
 
 .sidebar-item {
-  height: 120px;
+  min-height: 120px;       /* grows to fit the window-tree layer below the body */
   flex-shrink: 0;          /* prevent flex from compressing cards to fit */
   background: var(--bg-secondary);
   cursor: pointer;
@@ -630,10 +630,182 @@ body {
 }
 
 .sidebar-item-body {
-  flex: 1;
+  flex: 0 0 88px;          /* fixed preview area (was flex:1); tree sits below */
+  height: 88px;
   position: relative;
   overflow: hidden;
   background: #000000;
+}
+
+/* ---------------------------------------------------------------------------
+ * Window-tree layer — tmux windows of a session, rendered under the preview.
+ * Window names split on '/' nest as package segments; each window shows its
+ * @task option value as a dim label. Clicking a window activates it.
+ * ------------------------------------------------------------------------- */
+.sidebar-item-windows {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-secondary);
+  padding: 3px 0;
+}
+
+.wt-folder,
+.wt-window {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  position: relative; /* anchor for the .wt-connector tree elbow */
+  /* --wt-depth drives the indent; base 8px + 22px per level (#103 — was
+   * 12px/level, too subtle to read as hierarchy at a glance) */
+  padding: 2px 8px 2px calc(8px + var(--wt-depth, 0) * 22px);
+  font-size: 11px;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* Tree guide elbow (#103) — an L-shaped connector drawn in the indent gap of
+ * every depth ≥ 1 row: vertical line from the row top down to mid-height,
+ * then a horizontal stub toward the row's status icon. Placed at the parent
+ * level's indent column so nesting reads as explicit guide lines. */
+.wt-connector {
+  position: absolute;
+  left: calc(8px + (var(--wt-depth, 1) - 1) * 22px + 3px);
+  top: -3px;      /* reach up into the row gap for a continuous look */
+  bottom: 50%;
+  width: 12px;
+  border-left: 1px solid var(--border, #2A3040);
+  border-bottom: 1px solid var(--border, #2A3040);
+  border-bottom-left-radius: 4px;
+  pointer-events: none;
+}
+
+.wt-folder {
+  color: var(--text-muted);
+  font-weight: 600;
+  cursor: default;
+}
+
+.wt-folder .wt-name::before,
+.wt-window .wt-name::before {
+  content: '';
+}
+
+.wt-window {
+  color: var(--text);
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.wt-window:hover,
+.wt-window:focus-visible {
+  background: var(--bg-tile-hover);
+  outline: none;
+}
+
+.wt-window--active {
+  border-left-color: var(--accent);
+  background: var(--bg-surface);
+}
+
+.wt-window .wt-name {
+  color: var(--text);
+  font-weight: 500;
+  flex-shrink: 0;
+}
+
+.wt-window--active .wt-name {
+  color: var(--accent);
+}
+
+.wt-task {
+  color: var(--text-muted);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
+/* --- Per-window live status icon (fleet @fstate) --------------------------
+ * Leading 8px marker on every window row so the sidebar reads at a glance:
+ *   working  → spinning ring (answer generating)
+ *   reply    → solid green dot (reply arrived, waiting)
+ *   attention→ solid red dot (needs the human)
+ *   idle     → dim hollow dot (keeps rows aligned)
+ * ------------------------------------------------------------------------- */
+.wt-state {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  align-self: center;
+  box-sizing: border-box;
+}
+
+.wt-state--idle {
+  border: 1px solid var(--text-muted);
+  opacity: 0.35;
+}
+
+.wt-state--reply {
+  background: #2ecc71;
+  box-shadow: 0 0 4px rgba(46, 204, 113, 0.6);
+}
+
+.wt-state--attention {
+  background: #ff4d4f;
+  box-shadow: 0 0 5px rgba(255, 77, 79, 0.7);
+  animation: wt-attention-pulse 1.6s ease-in-out infinite;
+}
+
+.wt-state--working {
+  border: 1.5px solid var(--accent, #4aa3ff);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: wt-spin 0.7s linear infinite;
+  box-shadow: none;
+}
+
+/* Main window row (#103) — the session's control window. Pinned at depth 0
+ * (leftmost, top of its session block) and visually distinct from worker
+ * rows: bolder, larger, full-bright, with a subtle separating baseline. */
+.wt-window--main {
+  padding-top: 3px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 1px;
+}
+
+.wt-window--main .wt-name {
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+
+/* Dim idle rows overall so active/attention rows stand out. */
+.wt-window[data-state=""] .wt-name,
+.wt-window[data-state=""] .wt-task {
+  opacity: 0.7;
+}
+
+/* …but never dim the main row — it must stay instantly findable. */
+.wt-window--main[data-state=""] .wt-name,
+.wt-window--main[data-state=""] .wt-task {
+  opacity: 1;
+}
+
+.wt-window--attention .wt-name {
+  color: #ff7a7c;
+}
+
+@keyframes wt-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes wt-attention-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
 }
 
 
@@ -1127,6 +1299,14 @@ body {
 
   .new-session-fab:active {
     transform: none;
+  }
+
+  .wt-state--working {
+    animation: none;
+  }
+
+  .wt-state--attention {
+    animation: none;
   }
 }
 

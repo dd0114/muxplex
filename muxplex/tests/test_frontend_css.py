@@ -386,13 +386,27 @@ def test_css_sidebar_item_name():
 
 
 def test_css_sidebar_item_body():
-    """.sidebar-item-body must be flex: 1, position relative, overflow hidden."""
+    """.sidebar-item-body must be a fixed-height preview area, relative, overflow hidden.
+
+    Was flex:1; now a fixed 88px band so the window-tree layer can sit beneath
+    the preview inside the (now min-height) sidebar card.
+    """
     css = read_css()
     assert ".sidebar-item-body" in css
     block = _extract_rule_block(css, ".sidebar-item-body {")
-    assert "flex: 1" in block
+    assert "flex: 0 0 88px" in block
     assert "position: relative" in block
     assert "overflow: hidden" in block
+
+
+def test_css_window_tree_layer():
+    """Window-tree sidebar layer styles must exist for the tmux window rows."""
+    css = read_css()
+    assert ".sidebar-item-windows" in css
+    assert ".wt-window" in css
+    assert ".wt-task" in css
+    # Package indent is driven by the --wt-depth custom property.
+    assert "--wt-depth" in css
 
 
 def test_css_sidebar_item_body_pre():

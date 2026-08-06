@@ -33,7 +33,7 @@ import websockets
 from websockets.typing import Subprotocol
 
 from fastapi import FastAPI, Form, HTTPException, Request, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 from starlette.responses import RedirectResponse, Response
@@ -61,7 +61,9 @@ from muxplex.sessions import (
     get_session_list,
     get_snapshots,
     is_valid_session_name,
+    list_windows,
     run_tmux,
+    select_window,
     snapshot_all,
     tmux_env,
     update_session_cache,
@@ -737,6 +739,10 @@ class CreateSessionPayload(BaseModel):
         return stripped
 
 
+class SelectWindowPayload(BaseModel):
+    index: int
+
+
 class SessionInputPayload(BaseModel):
     """Body for POST /api/sessions/{name}/input.
 
@@ -784,13 +790,47 @@ _FRONTEND_DIR = pathlib.Path(__file__).parent / "frontend"
 _HOSTNAME = socket.gethostname().split(".")[0]
 
 # Canonical version string — sourced from package metadata (same as `app.version`
-# and the `doctor` command).  Used to append `?v=<version>` to every static-asset
-# URL so browsers immediately pick up new code on each release.
+# and the `doctor` command).  Fallback cache-busting token when an asset URL does
+# not resolve to a file on disk (see _asset_version).
 _UI_VERSION: str = importlib.metadata.version("muxplex")
 
 # Matches src="/<path>" and href="/<path>" in served HTML, excluding /api/ URLs.
 # Used by index_page() to inject cache-busting version query parameters.
 _ASSET_URL_RE = re.compile(r'((?:src|href)=")((?!/api/)/[^"?#]*)')
+
+# Per-asset content-hash cache: URL path -> short hash string. Populated lazily
+# on first request and reused for the life of the process. This is safe because
+# the installed frontend files never change while a process is running; a fresh
+# install + `service restart` starts a new process that re-hashes from scratch.
+_ASSET_VERSION_CACHE: dict[str, str] = {}
+
+
+def _asset_version(url_path: str) -> str:
+    """Return a cache-busting token for a static-asset URL.
+
+    Uses a short hash of the file's *content* so the ``?v=`` query changes
+    exactly when the asset changes — busting stale JS/CSS in the browser cache
+    on every build without a manual version bump, while unchanged assets (e.g.
+    large vendor libs) keep a stable token and stay cached.
+
+    Falls back to the package version (_UI_VERSION) when the URL does not map to
+    a readable file under the frontend dir (defensive — every current asset
+    resolves, but this keeps a nonsensical/removed path from breaking the page).
+    """
+    cached = _ASSET_VERSION_CACHE.get(url_path)
+    if cached is not None:
+        return cached
+    token = _UI_VERSION
+    # Resolve the URL path to a file under the frontend dir, guarding against
+    # path traversal (e.g. "/../secrets") escaping _FRONTEND_DIR.
+    candidate = (_FRONTEND_DIR / url_path.lstrip("/")).resolve()
+    try:
+        candidate.relative_to(_FRONTEND_DIR.resolve())
+        token = hashlib.sha256(candidate.read_bytes()).hexdigest()[:12]
+    except (OSError, ValueError):
+        pass
+    _ASSET_VERSION_CACHE[url_path] = token
+    return token
 
 
 # ---------------------------------------------------------------------------
@@ -865,6 +905,55 @@ async def get_sessions() -> list[dict]:
             }
         )
     return result
+
+
+@app.get("/api/windows")
+async def get_windows() -> dict[str, list[dict]]:
+    """Return all tmux windows grouped by session name (window-tree sidebar).
+
+    Each entry is {"index": int, "name": str, "active": bool, "task": str,
+    "state": str}. ``state`` is the window's live ``@fstate`` fleet option so
+    the sidebar can render a per-window activity icon (working / reply_ready /
+    needs_attention / idle).
+
+    Reuses the same tmux subprocess path as the rest of muxplex and is served
+    by the local viewer app (no new network surface).
+
+    Reinforcement: the ``@fstate`` option can go stale if the Stop hook was
+    missed (a window stuck showing ``working`` after it finished, or showing
+    ``reply_ready`` after a new generation started). muxplex already captures
+    each session's *active* pane into the snapshot cache, so when that snapshot
+    still shows tmux's live "esc to interrupt" affordance we force the active
+    window to ``working`` — a ground-truth signal that costs no extra tmux
+    calls. Non-active windows keep their reported ``@fstate``.
+    """
+    windows = await list_windows()
+    snapshots = get_snapshots()
+    for session_name, wins in windows.items():
+        snap = snapshots.get(session_name, "")
+        if "esc to interrupt" not in snap:
+            continue
+        for w in wins:
+            if w.get("active"):
+                w["state"] = "working"
+    return windows
+
+
+@app.post("/api/sessions/{name}/select-window")
+async def select_session_window(name: str, payload: SelectWindowPayload) -> dict:
+    """Activate a tmux window within *name* via ``tmux select-window``.
+
+    Raises HTTP 404 if the session is unknown (when the session list is
+    non-empty) or if tmux reports the target window does not exist.
+    """
+    known = get_session_list()
+    if known and name not in known:
+        raise HTTPException(status_code=404, detail=f"Session '{name}' not found")
+    try:
+        await select_window(name, payload.index)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return {"session": name, "index": payload.index, "ok": True}
 
 
 @app.get("/api/sessions/{name}")
@@ -2173,10 +2262,11 @@ async def federation_terminal_ws_proxy(websocket: WebSocket, device_id: str) -> 
 async def index_page():
     """Serve index.html with hostname injected into the page title.
 
-    Also appends ``?v=<version>`` to every static-asset URL (script src, link
-    href) so browsers immediately pick up new code on each release rather than
-    serving stale JS/CSS from the HTTP cache.  API URLs (/api/...) are
-    excluded — they are not HTTP-cached by browsers.
+    Also appends ``?v=<content-hash>`` to every static-asset URL (script src,
+    link href) so browsers immediately pick up new code whenever an asset's
+    content changes, without a manual version bump. Each asset is hashed
+    independently, so unchanged files keep a stable token and stay cached.  API
+    URLs (/api/...) are excluded — they are not HTTP-cached by browsers.
     """
     html = (_FRONTEND_DIR / "index.html").read_text()
     html = html.replace(
@@ -2184,7 +2274,7 @@ async def index_page():
         f"<title>{_HOSTNAME} \u2014 muxplex</title>",
     )
     html = _ASSET_URL_RE.sub(
-        lambda m: f"{m.group(1)}{m.group(2)}?v={_UI_VERSION}",
+        lambda m: f"{m.group(1)}{m.group(2)}?v={_asset_version(m.group(2))}",
         html,
     )
     # no-cache = "revalidate before use", NOT "don't cache" — installed PWAs
@@ -2720,6 +2810,53 @@ async def federation_delete_session(
             status_code=503,
             detail=f"Remote unreachable: {remote_url} ({type(exc).__name__}: {exc})",
         )
+
+
+# ---------------------------------------------------------------------------
+# Session-domain route — GET /<session_name>
+#
+# MUST be registered after every fixed route (first-match-wins) and BEFORE the
+# StaticFiles mount below: a Mount at "/" matches every remaining path, so a
+# route added after it would never fire.  Because this dynamic route therefore
+# also shadows *single-segment* static files (/app.js, /style.css, ...), the
+# handler explicitly falls through to the frontend dir first — real files
+# always win over session names.  Multi-segment paths (/vendor/xterm.js) never
+# match {session_name} and reach the StaticFiles mount unchanged.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/{session_name}", response_class=HTMLResponse)
+async def session_domain_page(session_name: str):
+    """Serve the dashboard index for a live tmux session name (domain view).
+
+    Opening /<session_name> where the name matches a live tmux session serves
+    the same index HTML as ``/`` — the frontend parses ``location.pathname``
+    and filters the sidebar/tiles to that one session (see app.js
+    parseDomainFilter).  Unknown names return 404.  Auth behaves exactly like
+    ``/`` because AuthMiddleware is path-generic (non-exempt, no static
+    extension → login redirect for unauthenticated remote clients).
+    """
+    # 1. Static-asset fallthrough: real frontend files always win.
+    candidate = (_FRONTEND_DIR / session_name).resolve()
+    try:
+        candidate.relative_to(_FRONTEND_DIR.resolve())
+    except ValueError:
+        # Traversal outside the frontend dir — never serve, never match.
+        raise HTTPException(status_code=404, detail="Not Found")
+    if candidate.is_file():
+        # Same revalidation contract as the _NoCacheStaticFiles mount below —
+        # this fallthrough shadows single-segment static files, so it must
+        # carry the identical Cache-Control header (installed PWAs revalidate
+        # on every load instead of serving stale JS across deploys).
+        return FileResponse(candidate, headers={"Cache-Control": "no-cache"})
+
+    # 2. Live tmux session name → serve the (cache-busted) index.
+    if session_name in get_session_list():
+        return await index_page()
+
+    raise HTTPException(
+        status_code=404, detail=f"Session '{session_name}' not found"
+    )
 
 
 # ---------------------------------------------------------------------------

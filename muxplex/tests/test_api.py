@@ -2,6 +2,8 @@
 Tests for muxplex/main.py — FastAPI skeleton, lifespan, /health endpoint.
 """
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -5579,3 +5581,52 @@ def test_federation_connect_device_id_not_found(client, monkeypatch, tmp_path):
     assert response.status_code == 404, (
         f"Expected 404 for unknown device_id, got {response.status_code}: {response.text}"
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/windows — live @fstate status + esc-to-interrupt boost
+# ---------------------------------------------------------------------------
+
+
+def test_get_windows_returns_state_field(client):
+    """The windows endpoint surfaces each window's live @fstate as 'state'."""
+    fake = {"hmb": [{"index": 0, "name": "main", "active": True, "task": "", "state": "reply_ready"}]}
+    with (
+        patch("muxplex.main.list_windows", new=AsyncMock(return_value=fake)),
+        patch("muxplex.main.get_snapshots", return_value={}),
+    ):
+        response = client.get("/api/windows")
+    assert response.status_code == 200
+    assert response.json()["hmb"][0]["state"] == "reply_ready"
+
+
+def test_get_windows_esc_to_interrupt_forces_active_window_working(client):
+    """When a session's cached snapshot still shows 'esc to interrupt', its
+    ACTIVE window is forced to 'working' even if @fstate went stale."""
+    fake = {
+        "hmb": [
+            {"index": 0, "name": "main", "active": True, "task": "", "state": "reply_ready"},
+            {"index": 1, "name": "deploy", "active": False, "task": "", "state": "reply_ready"},
+        ]
+    }
+    snaps = {"hmb": "thinking...\n(esc to interrupt)\n"}
+    with (
+        patch("muxplex.main.list_windows", new=AsyncMock(return_value=fake)),
+        patch("muxplex.main.get_snapshots", return_value=snaps),
+    ):
+        response = client.get("/api/windows")
+    body = response.json()
+    # Active window is upgraded to working; the non-active one is untouched.
+    assert body["hmb"][0]["state"] == "working"
+    assert body["hmb"][1]["state"] == "reply_ready"
+
+
+def test_get_windows_no_esc_leaves_state_untouched(client):
+    """Without the 'esc to interrupt' affordance, reported @fstate is kept."""
+    fake = {"hmb": [{"index": 0, "name": "main", "active": True, "task": "", "state": "reply_ready"}]}
+    with (
+        patch("muxplex.main.list_windows", new=AsyncMock(return_value=fake)),
+        patch("muxplex.main.get_snapshots", return_value={"hmb": "$ done\n"}),
+    ):
+        response = client.get("/api/windows")
+    assert response.json()["hmb"][0]["state"] == "reply_ready"

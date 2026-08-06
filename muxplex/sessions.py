@@ -321,6 +321,100 @@ async def capture_pane(session_name: str, lines: int = DEFAULT_CAPTURE_LINES) ->
         return ""
 
 
+# ---------------------------------------------------------------------------
+# Window enumeration (window-tree sidebar layer)
+# ---------------------------------------------------------------------------
+
+# Field separator for `tmux list-windows -F`. A tab cannot appear in a tmux
+# window name, session name, or option value, so it is a safe delimiter.
+_WINDOW_FIELD_SEP = "\t"
+_WINDOW_FORMAT = _WINDOW_FIELD_SEP.join(
+    [
+        "#{session_name}",
+        "#{window_index}",
+        "#{window_name}",
+        "#{window_active}",
+        "#{@task}",  # user option; expands to '' when unset
+        "#{@fstate}",  # fleet live state; '' when unset (see FLEET_STATES)
+        "#{@parent}",  # declared parent window name (tree nesting); '' when unset
+        "#{@group}",  # declared horizontal group name (tree folder); '' when unset
+    ]
+)
+
+# Recognized fleet activity states, set on the tmux ``@fstate`` window option by
+# the fleet-state hook (UserPromptSubmit→working, Stop→reply_ready,
+# Notification→needs_attention). Anything else (including '') is treated as idle
+# by the frontend. Kept here as the single source of truth for the vocabulary.
+FLEET_STATES = ("working", "reply_ready", "needs_attention", "stale")
+
+
+async def list_windows() -> dict[str, list[dict]]:
+    """Return all tmux windows grouped by session name.
+
+    Runs ``tmux list-windows -a -F <format>`` (one call, all sessions) and
+    parses each tab-delimited line into a dict:
+        {"index": int, "name": str, "active": bool, "task": str, "state": str,
+         "parent": str, "group": str}
+
+    ``parent``/``group`` are the declared tree options (``@parent`` nests a
+    window under the named window; ``@group`` collects windows under a folder);
+    both are '' when unset.
+
+    ``state`` is the window's live ``@fstate`` fleet option (see FLEET_STATES);
+    '' when the hook has never fired for that window. Because it is read from
+    the live tmux server it is naturally scoped to windows that actually exist
+    (unlike the ~/.fleet/state/*.json files, which accumulate stale entries).
+
+    Returns {} if tmux is not running (RuntimeError/FileNotFoundError).
+    """
+    try:
+        output = await run_tmux("list-windows", "-a", "-F", _WINDOW_FORMAT)
+    except (RuntimeError, FileNotFoundError):
+        return {}
+
+    windows: dict[str, list[dict]] = {}
+    for line in output.splitlines():
+        if not line:
+            continue
+        # maxsplit-limited on the leading fixed fields; @task, @fstate, @parent
+        # and @group are the trailing quartet. A tab cannot appear in a tmux
+        # window/session name, and the trailing option values are names from a
+        # controlled vocabulary, so positional splitting is safe.
+        parts = line.split(_WINDOW_FIELD_SEP, 7)
+        if len(parts) < 4:
+            continue
+        session_name, index_str, win_name, active_str = parts[:4]
+        task = parts[4] if len(parts) > 4 else ""
+        state = parts[5] if len(parts) > 5 else ""
+        parent = parts[6] if len(parts) > 6 else ""
+        group = parts[7] if len(parts) > 7 else ""
+        try:
+            index = int(index_str)
+        except ValueError:
+            continue
+        windows.setdefault(session_name, []).append(
+            {
+                "index": index,
+                "name": win_name,
+                "active": active_str == "1",
+                "task": task,
+                "state": state if state in FLEET_STATES else "",
+                "parent": parent,
+                "group": group,
+            }
+        )
+    return windows
+
+
+async def select_window(session_name: str, index: int) -> None:
+    """Activate window *index* in *session_name* via ``tmux select-window``.
+
+    Reuses run_tmux, so it honors the configured socket dir. Raises
+    RuntimeError (from run_tmux) if the target does not exist.
+    """
+    await run_tmux("select-window", "-t", f"{session_name}:{index}")
+
+
 async def ensure_history_retention(session_name: str) -> None:
     """Raise *session_name*'s tmux `history-limit` to SESSION_HISTORY_LIMIT.
 
