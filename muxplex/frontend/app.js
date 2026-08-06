@@ -562,17 +562,40 @@ function buildTileHTML(session, index, mobile) {
 }
 
 /**
- * Build a nested tree from a flat window list, splitting each window name on
- * '/' so that "ws2/docs" nests "docs" under a "ws2" package segment.
+ * Build a nested tree from a flat window list.
  *
- * Returns a root node: { children: {seg: node}, order: [seg,...] }.
- * A node with `.win` set corresponds to an actual tmux window (a leaf, though
- * it may also have children if another window nests beneath its name).
- * @param {object[]} windows - [{index,name,active,task}, ...]
+ * Two modes, chosen per session:
+ *  - Declared mode — used when ANY window carries a `parent` or `group`
+ *    declaration (tmux window options @parent/@group surfaced by
+ *    GET /api/windows). A window with `parent` nests under the window of that
+ *    name; windows sharing a `group` collect under a win-less folder node.
+ *    Root ordering: the `main` window first, then child-bearing roots, then
+ *    everything else (stable). Unknown-parent and cyclic-parent declarations
+ *    are demoted to root (defensive).
+ *  - Legacy mode — no declarations at all: split each window name on '/' so
+ *    "ws2/docs" nests "docs" under a "ws2" package segment (unchanged).
+ *
+ * Returns a root node: { children: {key: node}, order: [key,...] }.
+ * A node with `.win` set corresponds to an actual tmux window; a node with
+ * `.win === null` is a folder. `node.seg` is the display name.
+ * @param {object[]} windows - [{index,name,active,task,state,parent,group}, ...]
  */
 function buildWindowTree(windows) {
+  var wins = windows || [];
+  var hasDeclarations = wins.some(function (w) {
+    return Boolean(w.parent) || Boolean(w.group);
+  });
+  if (!hasDeclarations) return buildNameSplitTree(wins);
+  return buildDeclaredTree(wins);
+}
+
+/**
+ * Legacy tree: split window names on '/' into package-like segments.
+ * @param {object[]} wins
+ */
+function buildNameSplitTree(wins) {
   var root = { children: {}, order: [] };
-  (windows || []).forEach(function (w) {
+  wins.forEach(function (w) {
     var raw = String(w.name || '');
     var segs = raw.split('/').filter(function (s) { return s.length > 0; });
     if (segs.length === 0) segs = [raw];
@@ -586,6 +609,82 @@ function buildWindowTree(windows) {
       if (i === segs.length - 1) node.win = w;
     });
   });
+  return root;
+}
+
+/**
+ * Declaration-based tree from @parent/@group window options.
+ * @param {object[]} wins
+ */
+function buildDeclaredTree(wins) {
+  var root = { children: {}, order: [] };
+  var byName = {};
+  var nodes = {};
+  wins.forEach(function (w) {
+    var name = String(w.name || '');
+    byName[name] = w;
+    nodes[name] = { seg: name, children: {}, order: [], win: w };
+  });
+
+  // Resolve a window's declared parent to an attachable window name, or null.
+  // null when: unset, self-reference, target doesn't exist, or the parent
+  // chain loops back (cycle) — all demote the window to root.
+  function resolvedParent(w) {
+    var name = String(w.name || '');
+    var p = String(w.parent || '');
+    if (!p || p === name || !byName[p]) return null;
+    var seen = {};
+    seen[name] = true;
+    var cur = p;
+    while (cur) {
+      if (seen[cur]) return null; // cycle
+      seen[cur] = true;
+      var next = String((byName[cur] && byName[cur].parent) || '');
+      if (!next || !byName[next]) break;
+      cur = next;
+    }
+    return p;
+  }
+
+  var groupFolders = {};
+  wins.forEach(function (w) {
+    var name = String(w.name || '');
+    var node = nodes[name];
+    var p = resolvedParent(w);
+    if (p) {
+      nodes[p].children[name] = node;
+      nodes[p].order.push(name);
+      return;
+    }
+    var g = String(w.group || '');
+    if (g) {
+      var folder = groupFolders[g];
+      if (!folder) {
+        folder = { seg: g, children: {}, order: [], win: null };
+        groupFolders[g] = folder;
+        // Key namespaced so a window named like the group can't collide.
+        var key = 'group:' + g;
+        root.children[key] = folder;
+        root.order.push(key);
+      }
+      folder.children[name] = node;
+      folder.order.push(name);
+      return;
+    }
+    root.children[name] = node;
+    root.order.push(name);
+  });
+
+  // Root ordering: main first, then child-bearing nodes, then leaves (stable).
+  var ranked = root.order.map(function (key, i) {
+    var n = root.children[key];
+    var pri = n.win && String(n.win.name || '') === 'main'
+      ? 0
+      : (n.order.length > 0 ? 1 : 2);
+    return { key: key, pri: pri, i: i };
+  });
+  ranked.sort(function (a, b) { return (a.pri - b.pri) || (a.i - b.i); });
+  root.order = ranked.map(function (r) { return r.key; });
   return root;
 }
 
@@ -650,6 +749,9 @@ function renderWindowNode(node, depth) {
     var child = node.children[seg];
     var hasChildren = child.order.length > 0;
     var w = child.win;
+    // Display name: node.seg when present (declared-mode folder keys are
+    // namespaced, e.g. 'group:onboard'); fall back to the map key.
+    var label = child.seg || seg;
     var indent = ' style="--wt-depth:' + depth + '"';
     if (w) {
       var taskHtml = w.task
@@ -657,7 +759,7 @@ function renderWindowNode(node, depth) {
         : '';
       var activeCls = w.active ? ' wt-window--active' : '';
       var stateCls = stateModifierClass(w.state);
-      var titleText = w.task || seg;
+      var titleText = w.task || label;
       var stateLabel = stateAriaLabel(w.state);
       if (stateLabel) titleText += ' — ' + stateLabel;
       html +=
@@ -666,12 +768,12 @@ function renderWindowNode(node, depth) {
         ' data-state="' + escapeHtml(w.state || '') + '"' +
         ' role="listitem" tabindex="0" title="' + escapeHtml(titleText) + '">' +
         buildStateIconHTML(w.state) +
-        '<span class="wt-name">' + escapeHtml(seg) + '</span>' + taskHtml +
+        '<span class="wt-name">' + escapeHtml(label) + '</span>' + taskHtml +
         '</div>';
     } else {
       html +=
         '<div class="wt-folder"' + indent + '>' +
-        '<span class="wt-name">' + escapeHtml(seg) + '</span>' +
+        '<span class="wt-name">' + escapeHtml(label) + '</span>' +
         '</div>';
     }
     if (hasChildren) html += renderWindowNode(child, depth + 1);
@@ -4732,6 +4834,10 @@ if (typeof module !== 'undefined' && module.exports) {
     updateSessionPill,
     updatePageTitle,
     updateFaviconBadge,
+    // Window-tree sidebar (declaration-based hierarchy)
+    buildWindowTree,
+    renderWindowNode,
+    buildWindowTreeHTML,
     // ANSI color rendering
     ansiToHtml,
     ansiParamsToStyle,

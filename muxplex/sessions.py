@@ -178,6 +178,8 @@ _WINDOW_FORMAT = _WINDOW_FIELD_SEP.join(
         "#{window_active}",
         "#{@task}",  # user option; expands to '' when unset
         "#{@fstate}",  # fleet live state; '' when unset (see FLEET_STATES)
+        "#{@parent}",  # declared parent window name (tree nesting); '' when unset
+        "#{@group}",  # declared horizontal group name (tree folder); '' when unset
     ]
 )
 
@@ -193,7 +195,12 @@ async def list_windows() -> dict[str, list[dict]]:
 
     Runs ``tmux list-windows -a -F <format>`` (one call, all sessions) and
     parses each tab-delimited line into a dict:
-        {"index": int, "name": str, "active": bool, "task": str, "state": str}
+        {"index": int, "name": str, "active": bool, "task": str, "state": str,
+         "parent": str, "group": str}
+
+    ``parent``/``group`` are the declared tree options (``@parent`` nests a
+    window under the named window; ``@group`` collects windows under a folder);
+    both are '' when unset.
 
     ``state`` is the window's live ``@fstate`` fleet option (see FLEET_STATES);
     '' when the hook has never fired for that window. Because it is read from
@@ -211,16 +218,18 @@ async def list_windows() -> dict[str, list[dict]]:
     for line in output.splitlines():
         if not line:
             continue
-        # maxsplit-limited on the leading fixed fields; @task and @fstate are the
-        # trailing pair. @fstate is a controlled vocabulary with no tabs, so a
-        # final split on the last separator cleanly isolates it even if @task
-        # itself contained tabs.
-        parts = line.split(_WINDOW_FIELD_SEP, 5)
+        # maxsplit-limited on the leading fixed fields; @task, @fstate, @parent
+        # and @group are the trailing quartet. A tab cannot appear in a tmux
+        # window/session name, and the trailing option values are names from a
+        # controlled vocabulary, so positional splitting is safe.
+        parts = line.split(_WINDOW_FIELD_SEP, 7)
         if len(parts) < 4:
             continue
         session_name, index_str, win_name, active_str = parts[:4]
         task = parts[4] if len(parts) > 4 else ""
         state = parts[5] if len(parts) > 5 else ""
+        parent = parts[6] if len(parts) > 6 else ""
+        group = parts[7] if len(parts) > 7 else ""
         try:
             index = int(index_str)
         except ValueError:
@@ -232,6 +241,8 @@ async def list_windows() -> dict[str, list[dict]]:
                 "active": active_str == "1",
                 "task": task,
                 "state": state if state in FLEET_STATES else "",
+                "parent": parent,
+                "group": group,
             }
         )
     return windows

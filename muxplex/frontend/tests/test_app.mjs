@@ -5864,3 +5864,105 @@ test('v0.6.3: empty-state still appears when every device has zero visible sessi
   app._setServerSettings(null);
   app._setActiveView('all');
 });
+
+// ---------------------------------------------------------------------------
+// buildWindowTree — declaration-based hierarchy (@parent / @group)
+// ---------------------------------------------------------------------------
+
+test('buildWindowTree nests a @parent-declared window under its parent', () => {
+  const wins = [
+    { index: 0, name: 'rbi-finish', active: true, task: '', state: '', parent: '', group: '' },
+    { index: 1, name: 'rbi-a3', active: false, task: '', state: '', parent: 'rbi-finish', group: '' },
+    { index: 2, name: 'rbi-b3x', active: false, task: '', state: '', parent: 'rbi-finish', group: '' },
+  ];
+  const root = app.buildWindowTree(wins);
+  const parent = root.children['rbi-finish'];
+  assert.ok(parent, 'parent window should be a root node');
+  assert.ok(parent.win, 'parent node should carry its window');
+  assert.ok(parent.children['rbi-a3'], 'rbi-a3 should nest under rbi-finish');
+  assert.equal(parent.children['rbi-a3'].win.index, 1);
+  assert.ok(parent.children['rbi-b3x'], 'rbi-b3x should nest under rbi-finish');
+  assert.equal(root.order.length, 1, 'children must not also appear at root');
+});
+
+test('buildWindowTree collects same-@group windows under a group folder', () => {
+  const wins = [
+    { index: 0, name: 'main', active: true, task: '', state: '', parent: '', group: '' },
+    { index: 1, name: 'room-onboard', active: false, task: '', state: '', parent: '', group: 'onboard' },
+    { index: 2, name: 'onboard-api', active: false, task: '', state: '', parent: '', group: 'onboard' },
+  ];
+  const root = app.buildWindowTree(wins);
+  const folderKey = root.order.find((k) => root.children[k].win === null);
+  assert.ok(folderKey, 'a win-less folder node should exist at root');
+  const folder = root.children[folderKey];
+  assert.equal(folder.seg, 'onboard', 'folder displays the group name');
+  assert.ok(folder.children['room-onboard'], 'room-onboard under group folder');
+  assert.ok(folder.children['onboard-api'], 'onboard-api under group folder');
+});
+
+test('buildWindowTree sorts main window to the top in declared mode', () => {
+  const wins = [
+    { index: 0, name: 'zeta', active: false, task: '', state: '', parent: '', group: 'g1' },
+    { index: 1, name: 'alpha', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 2, name: 'main', active: true, task: '', state: '', parent: '', group: '' },
+  ];
+  const root = app.buildWindowTree(wins);
+  assert.equal(root.order[0], 'main', 'main window sorts first at root');
+});
+
+test('buildWindowTree sorts child-bearing roots above plain leaves in declared mode', () => {
+  const wins = [
+    { index: 0, name: 'loner', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 1, name: 'hub', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 2, name: 'spoke', active: false, task: '', state: '', parent: 'hub', group: '' },
+  ];
+  const root = app.buildWindowTree(wins);
+  assert.ok(root.order.indexOf('hub') < root.order.indexOf('loner'),
+    'root with children sorts above childless leaf');
+});
+
+test('buildWindowTree keeps legacy name-split tree when no declarations exist', () => {
+  const wins = [
+    { index: 0, name: 'ws2/docs', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 1, name: 'ws2/api', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 2, name: 'main', active: true, task: '', state: '', parent: '', group: '' },
+  ];
+  const root = app.buildWindowTree(wins);
+  assert.deepEqual(root.order, ['ws2', 'main'], 'legacy insertion order preserved');
+  assert.ok(root.children['ws2'].children['docs'], 'name-split nesting intact');
+  assert.equal(root.children['ws2'].children['api'].win.index, 1);
+});
+
+test('buildWindowTree keeps legacy tree for windows missing parent/group keys entirely', () => {
+  const wins = [
+    { index: 0, name: 'a/b', active: false, task: '', state: '' },
+    { index: 1, name: 'plain', active: false, task: '', state: '' },
+  ];
+  const root = app.buildWindowTree(wins);
+  assert.ok(root.children['a'].children['b'], 'old API shape falls back to name-split');
+});
+
+test('buildWindowTree demotes unknown-parent and cyclic-parent windows to root', () => {
+  const wins = [
+    { index: 0, name: 'orphan', active: false, task: '', state: '', parent: 'ghost', group: '' },
+    { index: 1, name: 'cyc-a', active: false, task: '', state: '', parent: 'cyc-b', group: '' },
+    { index: 2, name: 'cyc-b', active: false, task: '', state: '', parent: 'cyc-a', group: '' },
+  ];
+  const root = app.buildWindowTree(wins);
+  assert.ok(root.children['orphan'], 'unknown parent demoted to root');
+  assert.ok(root.children['cyc-a'], 'cycle member a demoted to root');
+  assert.ok(root.children['cyc-b'], 'cycle member b demoted to root');
+  assert.equal(root.children['cyc-a'].order.length, 0, 'no nesting inside a cycle');
+});
+
+test('renderWindowNode renders a group folder with wt-folder and nested windows deeper', () => {
+  const wins = [
+    { index: 1, name: 'room-onboard', active: false, task: '', state: '', parent: '', group: 'onboard' },
+    { index: 2, name: 'onboard-api', active: false, task: '', state: '', parent: '', group: 'onboard' },
+  ];
+  const root = app.buildWindowTree(wins);
+  const html = app.renderWindowNode(root, 0);
+  assert.ok(html.includes('wt-folder'), 'group renders as a folder row');
+  assert.ok(html.includes('onboard'), 'folder shows group name');
+  assert.ok(html.includes('--wt-depth:1'), 'group members indent one level deeper');
+});
