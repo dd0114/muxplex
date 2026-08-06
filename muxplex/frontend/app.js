@@ -334,6 +334,23 @@ function trackInteraction() {
  * Always resolves — errors are logged as warnings so the app can start normally.
  * @returns {Promise<void>}
  */
+/**
+ * Decide whether a server-side active_session should be reopened fullscreen
+ * on page load.  At a URL domain view (/<session_name>) only that session may
+ * be restored — reopening another session's terminal would contradict the
+ * "this page shows only <session_name>" semantics.  At / (no domain filter)
+ * behavior is unchanged.
+ *
+ * @param {string|null} activeSession - state.active_session from the server
+ * @param {string|null} domainFilter - current _domainFilter (null at /)
+ * @returns {boolean}
+ */
+function shouldRestoreSession(activeSession, domainFilter) {
+  if (!activeSession) return false;
+  if (domainFilter && activeSession !== domainFilter) return false;
+  return true;
+}
+
 async function restoreState() {
   try {
     const res = await api('GET', '/api/state');
@@ -341,7 +358,7 @@ async function restoreState() {
     if (state.active_view) {
       _activeView = state.active_view;
     }
-    if (state.active_session) {
+    if (shouldRestoreSession(state.active_session, _domainFilter)) {
       await openSession(state.active_session, {
         skipAnimation: true,
         remoteId: state.active_remote_id || '',
@@ -4947,6 +4964,7 @@ if (typeof module !== 'undefined' && module.exports) {
     visibleCount,
     // URL domain filter (/<session_name>)
     parseDomainFilter,
+    shouldRestoreSession,
     // Operation layer (Phase 2) — pure data ops
     _opAddMembership,
     _opRemoveMembership,

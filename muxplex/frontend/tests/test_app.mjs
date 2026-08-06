@@ -6048,3 +6048,16 @@ test('domain filter still excludes status entries (unreachable devices)', () => 
   assert.strictEqual(result[0].name, 'sidekick');
   app._setDomainFilter(null);
 });
+
+test('shouldRestoreSession blocks restoring a non-domain session at /<session>', () => {
+  // At /sidekick, a server-side active_session of "root" must NOT reopen
+  // fullscreen — the domain view shows only its own session.
+  assert.strictEqual(app.shouldRestoreSession('root', 'sidekick'), false);
+  assert.strictEqual(app.shouldRestoreSession('sidekick', 'sidekick'), true);
+});
+
+test('shouldRestoreSession keeps full restore behavior at / (no regression)', () => {
+  assert.strictEqual(app.shouldRestoreSession('root', null), true);
+  assert.strictEqual(app.shouldRestoreSession(null, null), false);
+  assert.strictEqual(app.shouldRestoreSession(null, 'sidekick'), false);
+});
