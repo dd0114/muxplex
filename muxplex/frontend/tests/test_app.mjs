@@ -5928,7 +5928,9 @@ test('buildWindowTree keeps legacy name-split tree when no declarations exist', 
     { index: 2, name: 'main', active: true, task: '', state: '', parent: '', group: '' },
   ];
   const root = app.buildWindowTree(wins);
-  assert.deepEqual(root.order, ['ws2', 'main'], 'legacy insertion order preserved');
+  // #103: main is promoted to the top even in legacy mode; the rest keeps
+  // its insertion order.
+  assert.deepEqual(root.order, ['main', 'ws2'], 'main first, rest stable');
   assert.ok(root.children['ws2'].children['docs'], 'name-split nesting intact');
   assert.equal(root.children['ws2'].children['api'].win.index, 1);
 });
@@ -6049,11 +6051,114 @@ test('domain filter still excludes status entries (unreachable devices)', () => 
   app._setDomainFilter(null);
 });
 
-test('shouldRestoreSession blocks restoring a non-domain session at /<session>', () => {
-  // At /sidekick, a server-side active_session of "root" must NOT reopen
-  // fullscreen — the domain view shows only its own session.
-  assert.strictEqual(app.shouldRestoreSession('root', 'sidekick'), false);
+test('getVisibleSessions pins the hub session into every domain view (#104)', () => {
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  app._setDomainFilter('sidekick');
+  const sessions = [
+    { name: 'hmb', snapshot: '' },
+    { name: 'root', snapshot: '' },
+    { name: 'sidekick', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.deepStrictEqual(
+    result.map((s) => s.name),
+    ['sidekick', 'root'],
+    'domain session first, hub session pinned after it',
+  );
+  app._setDomainFilter(null);
+});
+
+test('getVisibleSessions at /root shows the hub exactly once (#104)', () => {
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  app._setDomainFilter('root');
+  const sessions = [
+    { name: 'root', snapshot: '' },
+    { name: 'sidekick', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.deepStrictEqual(result.map((s) => s.name), ['root'], 'no duplicate hub entry');
+  app._setDomainFilter(null);
+});
+
+test('getVisibleSessions domain view shows hub even when hidden (#104)', () => {
+  app._setServerSettings({ hidden_sessions: ['root'], views: [] });
+  app._setActiveView('all');
+  app._setDomainFilter('hmb');
+  const sessions = [
+    { name: 'hmb', snapshot: '' },
+    { name: 'root', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.deepStrictEqual(result.map((s) => s.name), ['hmb', 'root']);
+  app._setDomainFilter(null);
+  app._setServerSettings(null);
+});
+
+// ─── Window-tree visual hierarchy — main pinned, workers demoted (#103) ──────
+
+test('renderWindowNode pins main at depth 0 and demotes sibling workers to depth 1 (#103)', () => {
+  const wins = [
+    { index: 1, name: 'main', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 2, name: 'workerA', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 3, name: 'workerB', active: false, task: '', state: '', parent: '', group: '' },
+  ];
+  const html = app.renderWindowNode(app.buildWindowTree(wins), 0);
+  const mainRow = html.match(/<div class="wt-window[^"]*wt-window--main[^"]*"[^>]*>/);
+  assert.ok(mainRow, 'main row carries the wt-window--main modifier');
+  assert.ok(mainRow[0].includes('--wt-depth:0'), 'main stays at depth 0');
+  const workerRows = html.match(/--wt-depth:1/g) || [];
+  assert.strictEqual(workerRows.length, 2, 'both sibling workers demoted to depth 1');
+  assert.ok(html.includes('wt-connector'), 'demoted rows draw a tree connector');
+});
+
+test('renderWindowNode nests declared children one level under demoted workers (#103)', () => {
+  const wins = [
+    { index: 1, name: 'main', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 2, name: 'boss', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 3, name: 'sub', active: false, task: '', state: '', parent: 'boss', group: '' },
+  ];
+  const html = app.renderWindowNode(app.buildWindowTree(wins), 0);
+  assert.ok(html.includes('--wt-depth:0'), 'main at depth 0');
+  assert.ok(html.includes('--wt-depth:1'), 'boss demoted to depth 1');
+  assert.ok(html.includes('--wt-depth:2'), 'declared child sits at depth 2');
+});
+
+test('renderWindowNode leaves sessions without a root main window undemoted (#103)', () => {
+  const wins = [
+    { index: 1, name: 'hub', active: false, task: '', state: '', parent: '', group: '' },
+    { index: 2, name: 'audit', active: false, task: '', state: '', parent: '', group: '' },
+  ];
+  const html = app.renderWindowNode(app.buildWindowTree(wins), 0);
+  assert.ok(!html.includes('--wt-depth:1'), 'no demotion without a main window');
+  assert.ok(!html.includes('wt-window--main'), 'no main modifier');
+  assert.ok(!html.includes('wt-connector'), 'no connectors at depth 0');
+});
+
+test('buildWindowTree orders main first in legacy name-split mode (#103)', () => {
+  const wins = [
+    { index: 1, name: 'home', active: false },
+    { index: 2, name: 'main', active: false },
+  ];
+  const root = app.buildWindowTree(wins);
+  assert.strictEqual(root.order[0], 'main', 'main promoted to the top');
+  assert.strictEqual(root.order[1], 'home');
+});
+
+test('shouldRestoreSession blocks restoring a non-domain, non-hub session at /<session>', () => {
+  // At /sidekick, a server-side active_session of "hmb" must NOT reopen
+  // fullscreen — the domain view shows only its own session (plus the hub).
+  assert.strictEqual(app.shouldRestoreSession('hmb', 'sidekick'), false);
   assert.strictEqual(app.shouldRestoreSession('sidekick', 'sidekick'), true);
+});
+
+test('shouldRestoreSession allows restoring the hub session at a domain view (#104)', () => {
+  // The hub session is pinned into every domain view, so a server-side
+  // active_session of "root" may legitimately reopen fullscreen there.
+  assert.strictEqual(app.HUB_SESSION_NAME, 'root');
+  assert.strictEqual(app.shouldRestoreSession('root', 'sidekick'), true);
+  assert.strictEqual(app.shouldRestoreSession('root', 'hmb'), true);
 });
 
 test('shouldRestoreSession keeps full restore behavior at / (no regression)', () => {

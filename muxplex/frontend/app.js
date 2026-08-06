@@ -252,6 +252,10 @@ function parseDomainFilter(pathname) {
   }
 }
 
+// Hub session name — the control-surface tmux session that must stay
+// reachable from every domain view (/sidekick, /hmb, …). See #104.
+const HUB_SESSION_NAME = 'root';
+
 // Initialized once at load from the real browser location; null in the node
 // test environment (window.location stub has no pathname) and at "/".
 let _domainFilter =
@@ -336,10 +340,11 @@ function trackInteraction() {
  */
 /**
  * Decide whether a server-side active_session should be reopened fullscreen
- * on page load.  At a URL domain view (/<session_name>) only that session may
- * be restored — reopening another session's terminal would contradict the
- * "this page shows only <session_name>" semantics.  At / (no domain filter)
- * behavior is unchanged.
+ * on page load.  At a URL domain view (/<session_name>) only that session —
+ * or the hub session (HUB_SESSION_NAME), which is pinned into every domain
+ * view (#104) — may be restored; reopening any other session's terminal
+ * would contradict the "this page shows only <session_name>" semantics.
+ * At / (no domain filter) behavior is unchanged.
  *
  * @param {string|null} activeSession - state.active_session from the server
  * @param {string|null} domainFilter - current _domainFilter (null at /)
@@ -347,7 +352,13 @@ function trackInteraction() {
  */
 function shouldRestoreSession(activeSession, domainFilter) {
   if (!activeSession) return false;
-  if (domainFilter && activeSession !== domainFilter) return false;
+  if (
+    domainFilter &&
+    activeSession !== domainFilter &&
+    activeSession !== HUB_SESSION_NAME
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -660,7 +671,25 @@ function buildNameSplitTree(wins) {
       if (i === segs.length - 1) node.win = w;
     });
   });
+  promoteMainFirst(root);
   return root;
+}
+
+/**
+ * Reorder a root node's children so the session's `main` window renders
+ * first (stable for everything else). Applied to legacy name-split trees;
+ * declared trees have their own three-way ranking that already puts main
+ * first. (#103 — main must sit at the very top of its session block.)
+ * @param {object} root
+ */
+function promoteMainFirst(root) {
+  var ranked = root.order.map(function (key, i) {
+    var n = root.children[key];
+    var pri = n.win && String(n.win.name || '') === 'main' ? 0 : 1;
+    return { key: key, pri: pri, i: i };
+  });
+  ranked.sort(function (a, b) { return (a.pri - b.pri) || (a.i - b.i); });
+  root.order = ranked.map(function (r) { return r.key; });
 }
 
 /**
@@ -793,8 +822,22 @@ function buildStateIconHTML(state) {
 /**
  * Recursively render a window-tree node to HTML. `depth` drives indentation
  * via the --wt-depth CSS custom property.
+ *
+ * Visual hierarchy (#103):
+ *  - When the root level contains a `main` window, main stays pinned at
+ *    depth 0 and every other root row is demoted one level, so the
+ *    main ↔ worker relationship is visible even for flat window lists.
+ *    Sessions without a root `main` window are rendered unchanged.
+ *  - main gets the `wt-window--main` modifier (bold/bigger styling).
+ *  - Every row at depth ≥ 1 gets a leading `.wt-connector` elbow so the
+ *    tree structure reads as explicit guide lines, not just whitespace.
  */
 function renderWindowNode(node, depth) {
+  var isRootLevel = depth === 0;
+  var hasRootMain = isRootLevel && node.order.some(function (key) {
+    var n = node.children[key];
+    return Boolean(n.win) && String(n.win.name || '') === 'main';
+  });
   var html = '';
   node.order.forEach(function (seg) {
     var child = node.children[seg];
@@ -803,31 +846,39 @@ function renderWindowNode(node, depth) {
     // Display name: node.seg when present (declared-mode folder keys are
     // namespaced, e.g. 'group:onboard'); fall back to the map key.
     var label = child.seg || seg;
-    var indent = ' style="--wt-depth:' + depth + '"';
+    var isMain = isRootLevel && Boolean(w) && String(w.name || '') === 'main';
+    var rowDepth = (hasRootMain && !isMain) ? depth + 1 : depth;
+    var indent = ' style="--wt-depth:' + rowDepth + '"';
+    var connector = rowDepth > 0
+      ? '<span class="wt-connector" aria-hidden="true"></span>'
+      : '';
     if (w) {
       var taskHtml = w.task
         ? '<span class="wt-task">' + escapeHtml(w.task) + '</span>'
         : '';
       var activeCls = w.active ? ' wt-window--active' : '';
       var stateCls = stateModifierClass(w.state);
+      var mainCls = isMain ? ' wt-window--main' : '';
       var titleText = w.task || label;
       var stateLabel = stateAriaLabel(w.state);
       if (stateLabel) titleText += ' — ' + stateLabel;
       html +=
-        '<div class="wt-window' + activeCls + stateCls + '"' + indent +
+        '<div class="wt-window' + activeCls + stateCls + mainCls + '"' + indent +
         ' data-window-index="' + escapeHtml(String(w.index)) + '"' +
         ' data-state="' + escapeHtml(w.state || '') + '"' +
         ' role="listitem" tabindex="0" title="' + escapeHtml(titleText) + '">' +
+        connector +
         buildStateIconHTML(w.state) +
         '<span class="wt-name">' + escapeHtml(label) + '</span>' + taskHtml +
         '</div>';
     } else {
       html +=
         '<div class="wt-folder"' + indent + '>' +
+        connector +
         '<span class="wt-name">' + escapeHtml(label) + '</span>' +
         '</div>';
     }
-    if (hasChildren) html += renderWindowNode(child, depth + 1);
+    if (hasChildren) html += renderWindowNode(child, rowDepth + 1);
   });
   return html;
 }
@@ -996,11 +1047,20 @@ function getVisibleSessions(sessions) {
   if (_domainFilter) {
     // URL domain view (/<session_name>): deterministic URL semantics beat
     // saved view membership and hidden state — filter the *live* session list
-    // (includeHidden, view "all") down to the one named session. Status
+    // (includeHidden, view "all") down to the named session. Status
     // entries (unreachable/auth_failed devices) are still excluded by
     // filterVisible's live-only pass.
+    //
+    // The hub session (HUB_SESSION_NAME) is pinned into every domain view
+    // (#104): the operator must always be able to reach the hub from
+    // /sidekick, /hmb, … Ordering is deterministic — domain session first,
+    // hub after it.
     var live = filterVisible(sessions, _serverSettings, 'all', { includeHidden: true });
-    return live.filter(function (s) { return s.name === _domainFilter; });
+    var domain = live.filter(function (s) { return s.name === _domainFilter; });
+    var hub = _domainFilter === HUB_SESSION_NAME
+      ? []
+      : live.filter(function (s) { return s.name === HUB_SESSION_NAME; });
+    return domain.concat(hub);
   }
   return filterVisible(sessions, _serverSettings, _activeView);
 }
@@ -4906,6 +4966,8 @@ if (typeof module !== 'undefined' && module.exports) {
     buildWindowTree,
     renderWindowNode,
     buildWindowTreeHTML,
+    promoteMainFirst,
+    HUB_SESSION_NAME,
     // ANSI color rendering
     ansiToHtml,
     ansiParamsToStyle,

@@ -654,12 +654,30 @@ body {
   display: flex;
   align-items: baseline;
   gap: 6px;
-  /* --wt-depth drives the package indent; base 8px + 12px per level */
-  padding: 2px 8px 2px calc(8px + var(--wt-depth, 0) * 12px);
+  position: relative; /* anchor for the .wt-connector tree elbow */
+  /* --wt-depth drives the indent; base 8px + 22px per level (#103 — was
+   * 12px/level, too subtle to read as hierarchy at a glance) */
+  padding: 2px 8px 2px calc(8px + var(--wt-depth, 0) * 22px);
   font-size: 11px;
   line-height: 1.3;
   white-space: nowrap;
   overflow: hidden;
+}
+
+/* Tree guide elbow (#103) — an L-shaped connector drawn in the indent gap of
+ * every depth ≥ 1 row: vertical line from the row top down to mid-height,
+ * then a horizontal stub toward the row's status icon. Placed at the parent
+ * level's indent column so nesting reads as explicit guide lines. */
+.wt-connector {
+  position: absolute;
+  left: calc(8px + (var(--wt-depth, 1) - 1) * 22px + 3px);
+  top: -3px;      /* reach up into the row gap for a continuous look */
+  bottom: 50%;
+  width: 12px;
+  border-left: 1px solid var(--border, #2A3040);
+  border-bottom: 1px solid var(--border, #2A3040);
+  border-bottom-left-radius: 4px;
+  pointer-events: none;
 }
 
 .wt-folder {
@@ -748,10 +766,33 @@ body {
   box-shadow: none;
 }
 
+/* Main window row (#103) — the session's control window. Pinned at depth 0
+ * (leftmost, top of its session block) and visually distinct from worker
+ * rows: bolder, larger, full-bright, with a subtle separating baseline. */
+.wt-window--main {
+  padding-top: 3px;
+  padding-bottom: 3px;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 1px;
+}
+
+.wt-window--main .wt-name {
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+
 /* Dim idle rows overall so active/attention rows stand out. */
 .wt-window[data-state=""] .wt-name,
 .wt-window[data-state=""] .wt-task {
   opacity: 0.7;
+}
+
+/* …but never dim the main row — it must stay instantly findable. */
+.wt-window--main[data-state=""] .wt-name,
+.wt-window--main[data-state=""] .wt-task {
+  opacity: 1;
 }
 
 .wt-window--attention .wt-name {
