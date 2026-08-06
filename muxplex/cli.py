@@ -1,6 +1,7 @@
 """muxplex CLI — web-based tmux session dashboard."""
 
 import argparse
+import logging
 import os
 import platform
 import shutil
@@ -314,8 +315,70 @@ def show_password() -> None:
         print("No password file found. Start muxplex to auto-generate one.")
 
 
-def _kill_stale_port_holder(port: int) -> None:
-    """Kill any existing process on *port* to prevent EADDRINUSE crash-loops.
+def _fetch_local_instance_info(port: int, timeout: float = 2.0) -> dict | None:
+    """Fetch ``/api/instance-info`` from whatever is serving *port* on localhost.
+
+    Probes https then http (TLS is optional in muxplex, so the scheme cannot be
+    assumed).  Certificate verification is disabled deliberately: we are talking
+    to ourselves on loopback and may not have the local CA installed. Returns
+    the parsed JSON dict on the first 200 response that decodes as a dict, or
+    None if nothing answered (port free, wrong service, refused, timeout, TLS
+    mismatch, garbage body).
+
+    DELIBERATELY SHARED, RAW FETCH ONLY -- do not add decision logic here.
+    Two callers use this:
+      - :func:`_port_holder_is_healthy_muxplex` (safety-critical: decides
+        whether the startup path is allowed to SIGTERM the port holder).
+      - ``muxplex doctor`` (cosmetic: reports the running version alongside
+        the installed one).
+    Sharing the network probe avoids duplicating the finicky
+    https-then-http-with-cert-bypass dance in two places, but each caller
+    still makes its OWN decision about what the response means. A change to
+    doctor's reporting must never be able to alter the port-kill safety
+    logic, so that logic stays entirely in
+    :func:`_port_holder_is_healthy_muxplex`, not here.
+    """
+    import json
+    import ssl
+    import urllib.request
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    for scheme in ("https", "http"):
+        url = f"{scheme}://127.0.0.1:{port}/api/instance-info"
+        try:
+            with urllib.request.urlopen(url, timeout=timeout, context=ctx) as resp:  # noqa: S310
+                if resp.status != 200:
+                    continue
+                data = json.loads(resp.read().decode("utf-8"))
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            continue  # refused / timeout / TLS mismatch / garbage -> nothing there
+    return None
+
+
+def _port_holder_is_healthy_muxplex(port: int, timeout: float = 2.0) -> bool:
+    """Return True if a live, responding muxplex is serving *port*.
+
+    WHY THIS EXISTS -- do not "simplify" it away:
+    Without this probe, :func:`_kill_stale_port_holder` cannot tell a hung/stale
+    holder apart from a perfectly healthy running server, so ANY second
+    invocation of the startup path silently SIGTERMs the live service.  A silent
+    kill of a healthy server is indistinguishable from a mystery outage -- it
+    produces a clean graceful shutdown in the logs with no crash and no
+    ``Stopping`` line from systemd, which is extremely hard to diagnose.  This
+    probe converts that silent kill into a loud, actionable refusal.
+    """
+    data = _fetch_local_instance_info(port, timeout=timeout)
+    # A real muxplex always reports both of these.
+    return isinstance(data, dict) and "device_id" in data and "version" in data
+
+
+def _kill_stale_port_holder(port: int, force: bool = False) -> None:
+    """Free *port* from a STALE holder, refusing to kill a healthy server.
 
     On service restart (``systemctl restart muxplex``), the old process may still
     be holding the port in TIME_WAIT state or simply not have exited yet.  Without
@@ -323,9 +386,26 @@ def _kill_stale_port_holder(port: int) -> None:
     restarts it in an infinite loop (observed: 2075+ restarts before manual
     intervention).
 
-    Uses ``lsof -ti :<port>`` to find occupants, sends SIGTERM, then waits 1 s
-    for the port to free.  Silently swallows all errors so that a missing ``lsof``
-    or a permission error never prevents the server from starting.
+    The original implementation killed *whatever* held the port, which meant a
+    stray invocation of the startup path would silently terminate a healthy,
+    serving muxplex.  Now the holder is probed first
+    (:func:`_port_holder_is_healthy_muxplex`) and killed ONLY on positive
+    evidence that it is not serving.  If it *is* serving, this raises
+    ``SystemExit(1)`` with an actionable message instead of starting.
+
+    Restart-race reasoning: during a legitimate ``systemctl restart``, systemd
+    waits for the old process to exit before starting the new one, so normally no
+    holder exists and the probe never runs.  If an old instance is still draining
+    and answers the probe, the new process exits non-zero and systemd retries
+    after ``RestartSec`` -- a bounded retry that resolves as soon as the old
+    instance finishes draining.  That is strictly better than killing a healthy
+    server, and cannot become a tight loop because each attempt costs a full
+    ``RestartSec`` delay.
+
+    Pass ``force=True`` (``muxplex serve --force-take-port``) to restore the old
+    unconditional behaviour.
+
+    A missing ``lsof`` or a permission error never prevents startup.
     """
     import signal
     import time
@@ -337,18 +417,85 @@ def _kill_stale_port_holder(port: int) -> None:
             text=True,
             timeout=5,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            my_pid = os.getpid()
-            for pid_str in result.stdout.strip().split("\n"):
-                try:
-                    pid = int(pid_str.strip())
-                    if pid != my_pid:
-                        os.kill(pid, signal.SIGTERM)
-                except (ValueError, ProcessLookupError, PermissionError):
-                    pass
-            time.sleep(1)  # Brief wait for the port to be released
     except Exception:
-        pass  # lsof not available or other error — proceed; uvicorn will fail naturally
+        return  # lsof not available or other error — proceed; uvicorn will fail naturally
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return  # nobody is holding the port
+
+    my_pid = os.getpid()
+    holders: list[int] = []
+    for pid_str in result.stdout.strip().split("\n"):
+        try:
+            pid = int(pid_str.strip())
+        except ValueError:
+            continue
+        if pid != my_pid:
+            holders.append(pid)
+
+    if not holders:
+        return
+
+    if not force and _port_holder_is_healthy_muxplex(port):
+        pids = ", ".join(str(p) for p in holders)
+        print(
+            f"ERROR: port {port} is already served by a healthy muxplex (pid {pids}).\n"
+            f"       Refusing to terminate it.\n"
+            f"\n"
+            f"       To restart the service properly:\n"
+            f"           systemctl --user restart muxplex\n"
+            f"       To take the port anyway (kills the running server):\n"
+            f"           muxplex serve --force-take-port",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    for pid in holders:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    time.sleep(1)  # Brief wait for the port to be released
+
+
+def configure_logging(level: int = logging.INFO) -> None:
+    """Ensure muxplex's own log records reach a real handler when serving.
+
+    ``uvicorn.run(..., log_level="info")`` only configures uvicorn's OWN
+    loggers (``uvicorn``, ``uvicorn.error``, ``uvicorn.access``) via its
+    internal dictConfig -- it never touches the root logger or any
+    ``muxplex.*`` logger. Without a handler here, an accepted ``/input``
+    call's audit line (``main.py``'s ``_log.info(...)`` in
+    ``send_session_input``) is silently discarded: the root logger has no
+    handlers and Python's handler-of-last-resort only surfaces WARNING and
+    above -- which is exactly why a *rejected* input's ``_log.warning``
+    reached the terminal while every *accepted* call's audit line vanished.
+
+    Deliberately scoped to the ``muxplex`` logger namespace, not the root
+    logger. Every module does ``logging.getLogger(__name__)`` (e.g.
+    ``muxplex.main``, ``muxplex.sessions``), so all of them are children of
+    the ``muxplex`` logger and pick up this level/handler via normal
+    propagation -- one handler covers the whole package. Configuring root
+    instead would also raise every third-party dependency's logger (httpx,
+    websockets, etc.) to INFO, turning the operator's audit trail into a
+    noisy firehose instead of the targeted signal it's meant to be.
+
+    Idempotent: safe to call more than once (e.g. across multiple ``serve()``
+    invocations in one process, as tests do) without installing duplicate
+    handlers -- checked by handler name rather than by clearing/reassigning
+    ``package_logger.handlers``, so a caller that added its own handler
+    beforehand is left alone.
+    """
+    package_logger = logging.getLogger("muxplex")
+    package_logger.setLevel(level)
+    if not any(h.name == "muxplex-audit" for h in package_logger.handlers):
+        handler = logging.StreamHandler()
+        handler.name = "muxplex-audit"
+        handler.setLevel(level)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        package_logger.addHandler(handler)
 
 
 def serve(
@@ -358,6 +505,7 @@ def serve(
     session_ttl: int | None = None,
     tls_cert: str | None = None,
     tls_key: str | None = None,
+    force_take_port: bool = False,
 ) -> None:
     """Start the muxplex server.
 
@@ -366,6 +514,10 @@ def serve(
     import uvicorn  # noqa: PLC0415
 
     from muxplex.settings import load_settings  # noqa: PLC0415
+
+    # Must happen before uvicorn.run(): see configure_logging()'s docstring --
+    # uvicorn's own log_level="info" below does not configure muxplex's loggers.
+    configure_logging()
 
     settings = load_settings()
     host = host if host is not None else settings.get("host", "127.0.0.1")
@@ -381,8 +533,9 @@ def serve(
     os.environ["MUXPLEX_AUTH"] = auth
     os.environ["MUXPLEX_SESSION_TTL"] = str(session_ttl)
 
-    # Prevent crash-loop on restart: kill any stale process holding the port
-    _kill_stale_port_holder(port)
+    # Prevent crash-loop on restart: free the port from a STALE holder only.
+    # Refuses to terminate a healthy running server -- see _kill_stale_port_holder.
+    _kill_stale_port_holder(port, force=force_take_port)
 
     from muxplex.main import app  # noqa: PLC0415
 
@@ -493,6 +646,32 @@ def doctor() -> None:
         f"  {ok_mark} Serve config: {cfg['host']}:{cfg['port']}"
         f" (auth={cfg['auth']}, ttl={cfg['session_ttl']}s)"
     )
+
+    # Running vs installed version. `_get_install_info`/`_check_for_update`
+    # above only ever look at what's INSTALLED -- they cannot see that a
+    # `uv tool install`/`upgrade` has not yet been picked up by the actual
+    # running service, which needs a restart to load the new code. This is
+    # exactly the gap that left a live server on v0.14.0 for hours after the
+    # install moved to v0.15.0, with nothing anywhere saying so.
+    running_info = _fetch_local_instance_info(cfg["port"])
+    if running_info is None:
+        # A perfectly normal state (muxplex not started, or started on a
+        # different port) -- NOT an error, so it must read differently from
+        # the "running but stale" case below.
+        print(
+            f"  {warn_mark} Running: not serving on {cfg['host']}:{cfg['port']}"
+            " (nothing to compare against the installed version)"
+        )
+    else:
+        running_version = running_info.get("version") or "unknown"
+        if running_version == muxplex_version:
+            print(f"  {ok_mark} Running: v{running_version} (matches installed)")
+        else:
+            print(
+                f"  {warn_mark} Running: v{running_version}"
+                f" (installed v{muxplex_version} \u2014 restart the service to pick up the new install)"
+            )
+            print("    Run: muxplex upgrade   (or) systemctl --user restart muxplex")
 
     # TLS status
     tls_cert = cfg.get("tls_cert", "")
@@ -896,6 +1075,41 @@ def upgrade(*, force: bool = False) -> None:
     doctor()
 
 
+def cmd_env() -> None:
+    """Print a shell-eval-able TMUX_TMPDIR export for THIS muxplex instance.
+
+    Designed for `eval "$(muxplex env)"` (the ssh-agent/direnv convention).
+    Prints ONLY the export line to stdout -- no banners, no extra output --
+    so `eval` is always safe. Any human-facing notes go to stderr.
+
+    Why this exists: muxplex looks for tmux sessions under a specific
+    socket directory (`tmux_socket_dir` setting, mapped to tmux's
+    TMUX_TMPDIR env var). Any OTHER tool that creates a tmux session
+    without setting the same TMUX_TMPDIR lands on a DIFFERENT tmux server
+    and is silently invisible to this muxplex instance -- see AGENTS.md's
+    "tmux socket" section and settings.py's tmux_socket_dir comment. Running
+    `eval "$(muxplex env)"` before creating a session is the one-line fix.
+
+    Best-effort resolution: this CLI process's own environment is not
+    necessarily the same as the running muxplex *service* process's
+    environment (a systemd/launchd unit's env commonly differs from an
+    interactive shell's). When `tmux_socket_dir` is explicitly configured
+    in settings.json, that value is authoritative and this caveat doesn't
+    apply. When it's unset, the printed value is inferred from this
+    process's own TMUX_TMPDIR (or tmux's compiled-in default) and may not
+    exactly match what the service resolves -- see
+    settings.resolve_tmux_socket_dir()'s docstring for the full precedence.
+    """
+    from muxplex.settings import resolve_tmux_socket_dir  # noqa: PLC0415
+
+    print(f'export TMUX_TMPDIR="{resolve_tmux_socket_dir()}"')
+    print(
+        'Run `eval "$(muxplex env)"` before creating tmux sessions you want '
+        'this muxplex instance to see. See AGENTS.md\'s "tmux socket" section.',
+        file=sys.stderr,
+    )
+
+
 def config_list() -> None:
     """Show all settings with current values."""
     from muxplex.settings import DEFAULT_SETTINGS, SETTINGS_PATH, load_settings  # noqa: PLC0415
@@ -1274,6 +1488,15 @@ def _add_serve_flags(parser: argparse.ArgumentParser) -> None:
         dest="tls_key",
         help="Path to TLS private key file (default: from settings.json)",
     )
+    parser.add_argument(
+        "--force-take-port",
+        action="store_true",
+        dest="force_take_port",
+        help=(
+            "Terminate whatever holds the port, even a healthy running muxplex. "
+            "Without this, startup refuses rather than killing a live server."
+        ),
+    )
 
 
 def main() -> None:
@@ -1318,6 +1541,11 @@ def main() -> None:
     )
 
     sub.add_parser("doctor", help="Check dependencies and system status")
+
+    sub.add_parser(
+        "env",
+        help='Print `eval`-able TMUX_TMPDIR export (use: eval "$(muxplex env)")',
+    )
 
     upgrade_parser = sub.add_parser(
         "upgrade",
@@ -1373,6 +1601,8 @@ def main() -> None:
         generate_federation_key()
     elif args.command == "doctor":
         doctor()
+    elif args.command == "env":
+        cmd_env()
     elif args.command in ("upgrade", "update"):
         upgrade(force=getattr(args, "force", False))
     elif args.command == "config":
@@ -1428,4 +1658,5 @@ def main() -> None:
             session_ttl=args.session_ttl,
             tls_cert=args.tls_cert,
             tls_key=args.tls_key,
+            force_take_port=getattr(args, "force_take_port", False),
         )

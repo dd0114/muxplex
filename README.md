@@ -64,6 +64,12 @@
 - `muxplex upgrade` — smart version check + auto-update + service restart
 - `muxplex config` — CLI settings management
 
+### Agents & Automation
+
+- **Public HTTP API** — the contract is discoverable at `/openapi.json` and `/docs`; headless clients authenticate with a Bearer federation key
+- **Terminal input over the API** — `POST /api/sessions/{name}/input` lets an agent type into a live session (RCE by design, default-CLOSED, fenced by `input_enabled` + `input_allowed_sessions`)
+- **Vendor-neutral guide** — point any agent (or a `curl` script) at [Driving muxplex from an agent](docs/AGENT_GUIDE.md)
+
 ### HTTPS / TLS
 
 - `muxplex setup-tls` — auto-detect and set up TLS certificates
@@ -95,7 +101,7 @@
 Run muxplex directly without installing anything permanently:
 
 ```bash
-uvx --from git+https://github.com/bkrabach/muxplex muxplex
+uvx muxplex
 ```
 
 Then open **http://localhost:8088** in your browser.
@@ -107,9 +113,22 @@ Then open **http://localhost:8088** in your browser.
 ## Install Permanently
 
 ```bash
-uv tool install git+https://github.com/bkrabach/muxplex
+uv tool install muxplex
 muxplex doctor  # verify dependencies
 ```
+
+Upgrade later with either:
+
+```bash
+uv tool upgrade muxplex   # standard uv workflow
+muxplex upgrade           # also restarts the service if installed
+```
+
+> **Installing from git instead?** `uv tool install git+https://github.com/bkrabach/muxplex`
+> tracks the default branch and gets unreleased commits. Do **not** pin a tag
+> (`...@v1.2.3`) unless you mean it: `uv tool upgrade` resolves strictly within the
+> recorded requirement, so a pinned rev reports "Nothing to upgrade" forever. Released
+> versions on PyPI are the recommended path.
 
 Then run it any time with:
 
@@ -161,6 +180,7 @@ muxplex show-password                Show current auth password
 muxplex reset-secret                 Regenerate signing secret
 muxplex setup-tls [--method auto]   Set up TLS certs (Tailscale/mkcert/self-signed)
 muxplex setup-tls --status          Show current TLS configuration
+muxplex env                          Print `eval`-able TMUX_TMPDIR export
 ```
 
 ### Service management
@@ -231,6 +251,51 @@ Not part of the `auto` cascade — must be opted into explicitly.
 
 > **→ See [docs/TRUSTING_THE_LOCAL_CA.md](docs/TRUSTING_THE_LOCAL_CA.md)** for per-platform install instructions (Windows, macOS, Linux, iOS, Android, Firefox).
 
+#### Fetching the CA over the network: `GET /api/ca`
+
+Installing the CA on each client previously required `scp`-ing it off the server, which needs SSH access the client may not have — and it's easy to grab the wrong file (`muxplex.crt`, the **leaf** the server presents on the wire) instead of the CA, producing "unable to get local issuer certificate". `GET /api/ca` serves the CA's public certificate directly over HTTP(S) — no SSH, no auth (a CA public cert isn't a secret; it's the trust anchor clients are meant to install), and no ambiguity about which file it is:
+
+```bash
+curl -k https://my-host:8088/api/ca -o muxplex-ca.crt
+```
+
+`-k` is acceptable **only** for this one bootstrap fetch of a public trust anchor (there's nothing sensitive to expose by skipping verification here). For high-trust setups, confirm the fingerprint out-of-band before trusting it:
+
+```bash
+openssl x509 -in muxplex-ca.crt -noout -fingerprint -sha256
+```
+
+Returns 404 if this server isn't using `setup-tls --method ca` (e.g. it's on Tailscale, mkcert, or self-signed instead).
+
+### tmux socket (the "invisible session" hazard)
+
+muxplex looks for tmux sessions under a specific socket directory (the
+`tmux_socket_dir` setting, mapped to tmux's `TMUX_TMPDIR` environment
+variable). **Any other tool or script that creates a tmux session without
+setting the same `TMUX_TMPDIR` lands on a *different* tmux server** and is
+silently invisible to muxplex — `tmux list-sessions` from your interactive
+shell will show it, but muxplex's dashboard, API, and Stream Deck sidecar
+never will, because they're watching a different socket. This bites hardest
+when `tmux_socket_dir` is left at its default (`""`): a systemd/launchd
+*service* process doesn't inherit your login shell's `TMUX_TMPDIR`, so the
+service quietly falls back to tmux's compiled-in default
+(`/tmp/tmux-$UID`) even if your shell rc sets something else.
+
+The one-line fix — run this before creating a session you want muxplex to see:
+
+```bash
+eval "$(muxplex env)"
+tmux new-session -d -s my-session   # now lands where muxplex can see it
+```
+
+`muxplex env` prints a single `export TMUX_TMPDIR=...` line (nothing else,
+so `eval` is always safe) resolved from the configured `tmux_socket_dir` —
+or, if that's unset, your shell's own `TMUX_TMPDIR` — or, failing both,
+tmux's own default. `GET /api/instance-info` also exposes `tmux_socket_dir`
+(the exact value the *running server* resolves, since that endpoint runs
+inside the server process itself) so remote tools/agents can discover it
+without SSH access or tribal knowledge.
+
 ---
 
 ## Configuration
@@ -247,11 +312,13 @@ All settings are stored in `~/.config/muxplex/settings.json`.
 | `sort_order` | `manual` | Session ordering: `manual`, `alphabetical`, `recent` |
 | `hidden_sessions` | `[]` | Sessions hidden from the dashboard |
 | `views` | `[]` | Named session views for grouping and filtering sessions |
-| `stale_key_grace_hours` | `24.0` | Hours before a session key absent from all live sessions is pruned from views/hidden_sessions (syncable; per-device bookkeeping is local-only) |
+| `stale_key_grace_hours` | `24.0` | Hours before a session key absent from all *known* live sessions is pruned from views/hidden_sessions (syncable; per-device bookkeeping is local-only). Federation-aware: a remote device's keys are only ever evaluated for pruning while that device is currently reachable (see "Stale-key pruning" below) -- an offline device's view membership is never touched. |
 | `window_size_largest` | `false` | Auto-set tmux `window-size largest` on connect |
 | `auto_open_created` | `true` | Auto-open newly created sessions |
 | `new_session_template` | `tmux new-session -d -s {name}` | Command template for creating sessions |
 | `delete_session_template` | `tmux kill-session -t {name}` | Command template for deleting sessions |
+| `input_enabled` | `false` | Global opt-in for `POST /api/sessions/{name}/input` (typing into sessions over the API). **RCE by design** — `false` makes the endpoint a hard 403. **Local-file-only**: can ONLY be set by editing `settings.json` on disk — deliberately not settable via `PATCH /api/settings` (a Bearer-key holder must not be able to self-authorize input) and not federation-syncable. |
+| `input_allowed_sessions` | `[]` | **Glob patterns** (matched case-INsensitively — both name and pattern are `.casefold()`-ed before `fnmatch.fnmatchcase`, so behavior is deterministic across platforms) naming sessions that may receive API terminal input, e.g. `["*"]` for all sessions, `["amplifier-*"]` for a prefix family, or an exact name (matches only itself). A session matching none of the patterns is a 403 even when `input_enabled` is true — this is how your own working panes stay un-typeable. Empty list = deny everything. **Local-file-only**: can ONLY be set by editing `settings.json` on disk — deliberately not settable via `PATCH /api/settings` and not federation-syncable. |
 | `tmux_socket_dir` | `""` | Override tmux's socket directory (maps to `TMUX_TMPDIR`). Set this if your tmux sessions live somewhere other than `/tmp/tmux-$UID` (e.g. a custom `TMUX_TMPDIR` in your shell rc) -- a systemd/launchd service does not inherit your login shell's environment, so without this the service can't see sessions created with a custom socket directory. |
 | `device_name` | `""` (hostname) | Display name for this device |
 | `federation_key` | `""` | Server-to-server authentication key for federation |
@@ -270,8 +337,16 @@ All settings are stored in `~/.config/muxplex/settings.json`.
 | `gridViewMode` | `"flat"` | Multi-device grid layout: `flat`, `grouped`, `filtered` |
 | `sidebarOpen` | `null` | Sidebar state: `true`, `false`, or `null` (auto-detect from screen width) |
 | `settings_updated_at` | `0.0` | Unix timestamp of last settings write (used for federation sync) |
+| `views_updated_at` | `0.0` | Unix timestamp of last change to `views`/`hidden_sessions` specifically. Metadata like `settings_updated_at`, used to arbitrate views-specific federation sync conflicts independently of unrelated field changes (e.g. a `fontSize` edit no longer bumps this). Not itself a syncable setting -- see AGENTS.md's federation section. |
 
 **Priority:** CLI flags > `settings.json` > defaults.
+
+> **→ Writing something that drives muxplex?** The rows above define
+> `input_enabled` / `input_allowed_sessions` as *configuration*. For the
+> operational side — auth, the read endpoints, session lifecycle, the terminal-input
+> contract and its threat model, and copy-pasteable `curl` examples — see
+> [docs/AGENT_GUIDE.md](docs/AGENT_GUIDE.md). It's vendor-neutral: point any agent
+> or script at it.
 
 ---
 

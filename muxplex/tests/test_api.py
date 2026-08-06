@@ -55,8 +55,10 @@ def reset_federation_cache():
     import muxplex.main as main_mod
 
     main_mod._federation_cache.clear()
+    main_mod._federation_breaker.reset()
     yield
     main_mod._federation_cache.clear()
+    main_mod._federation_breaker.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +264,62 @@ def test_patch_state_active_view_defaults_to_all(client):
     assert data["active_view"] == "all"
 
 
+def test_get_state_includes_settings_updated_at(client):
+    """GET /api/state carries settings_updated_at (mirrors settings.py) so
+    pollers can detect a settings/view-membership change via the same poll
+    that already carries active_session/active_view -- see main.py get_state().
+    """
+    response = client.get("/api/state")
+    assert response.status_code == 200
+    data = response.json()
+    assert "settings_updated_at" in data
+    assert isinstance(data["settings_updated_at"], float)
+
+
+def test_get_state_settings_updated_at_changes_after_settings_write(
+    client, tmp_path, monkeypatch
+):
+    """A settings write (PATCH /api/settings, e.g. editing view membership)
+    bumps settings_updated_at, and the NEXT GET /api/state reflects the new
+    value -- this is the change signal followRemoteViewDefinitions() polls
+    for on the frontend.
+
+    Isolates SETTINGS_PATH to a tmp file like every other settings-writing
+    test in this file: without it, this test reads/writes whatever
+    ~/.config/muxplex/settings.json happens to exist on the machine running
+    the suite (on a box that also runs a live muxplex instance, that is the
+    LIVE production config). A pre-existing on-disk `views` list longer than
+    one entry would trip the destructive-write backstop (views.py) against
+    this test's single-view patch and turn the expected 200 into a 409 --
+    entirely an artifact of ambient state, not a real product bug.
+    """
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+
+    before = client.get("/api/state").json()["settings_updated_at"]
+
+    patch_response = client.patch(
+        "/api/settings", json={"views": [{"name": "Focus", "sessions": ["alpha"]}]}
+    )
+    assert patch_response.status_code == 200
+
+    after = client.get("/api/state").json()["settings_updated_at"]
+    assert after > before
+
+
+def test_get_state_settings_updated_at_not_persisted_in_state_json(client):
+    """settings_updated_at is merged into the API response at read time --
+    it must NOT be written into state.json itself (that's settings.py's
+    field). Confirms the two schemas stay decoupled.
+    """
+    from muxplex.state import load_state
+
+    client.get("/api/state")
+    on_disk = load_state()
+    assert "settings_updated_at" not in on_disk
+
+
 # ---------------------------------------------------------------------------
 # GET /api/sessions
 # ---------------------------------------------------------------------------
@@ -361,7 +419,483 @@ def test_get_sessions_returns_empty_list_when_no_sessions(client, monkeypatch):
 
     response = client.get("/api/sessions")
     assert response.status_code == 200
-    assert response.json() == []
+
+
+# ---------------------------------------------------------------------------
+# GET /api/sessions/{name} -- caller-controlled read depth (scrollback fix)
+# ---------------------------------------------------------------------------
+
+
+def test_get_session_snapshot_returns_live_capture(client, monkeypatch):
+    """GET /api/sessions/{name} does a live capture_pane(), not the cache."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+
+    captured_args = []
+
+    async def fake_capture_pane(name: str, lines: int) -> str:
+        captured_args.append((name, lines))
+        return "line1\nline2\n...\nline500\n"
+
+    monkeypatch.setattr("muxplex.main.capture_pane", fake_capture_pane)
+
+    response = client.get("/api/sessions/alpha?lines=500")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "alpha"
+    assert body["lines"] == 500
+    assert body["snapshot"] == "line1\nline2\n...\nline500\n"
+    assert captured_args == [("alpha", 500)]
+
+
+def test_get_session_snapshot_defaults_to_default_capture_lines(client, monkeypatch):
+    """Omitting ?lines= must preserve the original 30-line default -- unchanged shape."""
+    from muxplex.sessions import DEFAULT_CAPTURE_LINES
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+
+    captured_args = []
+
+    async def fake_capture_pane(name: str, lines: int) -> str:
+        captured_args.append((name, lines))
+        return ""
+
+    monkeypatch.setattr("muxplex.main.capture_pane", fake_capture_pane)
+
+    response = client.get("/api/sessions/alpha")
+    assert response.status_code == 200
+    assert response.json()["lines"] == DEFAULT_CAPTURE_LINES
+    assert captured_args == [("alpha", DEFAULT_CAPTURE_LINES)]
+
+
+def test_get_session_snapshot_rejects_lines_over_max(client, monkeypatch):
+    """?lines= above MAX_CAPTURE_LINES must be a 400, not a silently-clamped 200."""
+    from muxplex.sessions import MAX_CAPTURE_LINES
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+
+    response = client.get(f"/api/sessions/alpha?lines={MAX_CAPTURE_LINES + 1}")
+    assert response.status_code == 400
+    assert "lines" in response.json()["detail"]
+
+
+def test_get_session_snapshot_rejects_lines_below_one(client, monkeypatch):
+    """?lines=0 (or negative) must be a 400."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+
+    response = client.get("/api/sessions/alpha?lines=0")
+    assert response.status_code == 400
+
+
+def test_get_session_snapshot_accepts_max_capture_lines_exactly(client, monkeypatch):
+    """The upper bound itself (MAX_CAPTURE_LINES) must be accepted, not rejected."""
+    from muxplex.sessions import MAX_CAPTURE_LINES
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+
+    async def fake_capture_pane(name: str, lines: int) -> str:
+        return "x" * 10
+
+    monkeypatch.setattr("muxplex.main.capture_pane", fake_capture_pane)
+
+    response = client.get(f"/api/sessions/alpha?lines={MAX_CAPTURE_LINES}")
+    assert response.status_code == 200
+    assert response.json()["lines"] == MAX_CAPTURE_LINES
+
+
+def test_get_session_snapshot_404_for_unknown_session(client, monkeypatch):
+    """An unknown session name -> 404, same fail-closed pattern as connect/delete/input."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+
+    response = client.get("/api/sessions/ghost")
+    assert response.status_code == 404
+
+
+def test_get_session_snapshot_400_for_invalid_name(client, monkeypatch):
+    """A name that fails is_valid_session_name must 400 before any lookup."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+
+    response = client.get("/api/sessions/-leading-dash")
+    assert response.status_code == 400
+
+
+def test_get_session_snapshot_includes_bell_and_activity(client, monkeypatch):
+    """Response shape must match GET /api/sessions's per-item fields (bell, last_activity_at)."""
+    from muxplex.state import save_state
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+    monkeypatch.setattr(
+        "muxplex.main.get_session_activity", lambda: {"alpha": 1700000000.0}
+    )
+
+    async def fake_capture_pane(name: str, lines: int) -> str:
+        return "pane text"
+
+    monkeypatch.setattr("muxplex.main.capture_pane", fake_capture_pane)
+    save_state(
+        {
+            "active_session": None,
+            "session_order": ["alpha"],
+            "sessions": {
+                "alpha": {
+                    "bell": {
+                        "last_fired_at": 1234567890.0,
+                        "seen_at": None,
+                        "unseen_count": 2,
+                    }
+                }
+            },
+            "devices": {},
+        }
+    )
+
+    response = client.get("/api/sessions/alpha")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["bell"]["unseen_count"] == 2
+    assert body["last_activity_at"] == 1700000000.0
+
+
+def test_get_sessions_includes_last_activity_at(client, monkeypatch):
+    """GET /api/sessions must include last_activity_at with the cached
+    session-activity epoch timestamp."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["epsilon"])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {"epsilon": "pane"})
+    monkeypatch.setattr(
+        "muxplex.main.get_session_activity", lambda: {"epsilon": 1700000000.0}
+    )
+
+    response = client.get("/api/sessions")
+    assert response.status_code == 200
+    items = response.json()
+    assert len(items) == 1
+    assert items[0]["last_activity_at"] == 1700000000.0
+
+
+def test_get_sessions_last_activity_at_null_when_unknown(client, monkeypatch):
+    """GET /api/sessions must return last_activity_at: null for a session
+    tmux reported no activity value for, rather than omitting the field."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["zeta"])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {"zeta": "pane"})
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+
+    response = client.get("/api/sessions")
+    assert response.status_code == 200
+    items = response.json()
+    assert len(items) == 1
+    assert "last_activity_at" in items[0]
+    assert items[0]["last_activity_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# GET /api/view
+# ---------------------------------------------------------------------------
+
+
+def _view_settings(**overrides) -> dict:
+    """Build a minimal settings dict for /api/view tests; merge overrides."""
+    base = {"sort_order": "manual", "hidden_sessions": [], "views": []}
+    base.update(overrides)
+    return base
+
+
+def test_get_view_default_shape_and_all_view(client, monkeypatch):
+    """GET /api/view with no views defined returns view='all', views=['all'],
+    sort='server', and all sessions (no hidden_sessions/views configured)."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha", "beta"])
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+    monkeypatch.setattr("muxplex.main.load_settings", lambda: _view_settings())
+
+    response = client.get("/api/view")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["view"] == "all"
+    assert data["views"] == ["all"]
+    assert data["sort"] == "server"
+    names = [s["name"] for s in data["sessions"]]
+    assert names == ["alpha", "beta"]
+    for s in data["sessions"]:
+        assert "active" in s
+        assert "needs_attention" in s
+        assert "bell" in s
+        assert "last_activity_at" in s
+
+
+def test_get_view_named_view_filters_membership(client, monkeypatch):
+    """GET /api/view with active_view set to a user view only returns member sessions."""
+    from muxplex.state import load_state, save_state
+
+    monkeypatch.setattr(
+        "muxplex.main.get_session_list", lambda: ["alpha", "beta", "gamma"]
+    )
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+    monkeypatch.setattr(
+        "muxplex.main.load_settings",
+        lambda: _view_settings(
+            views=[{"name": "Work", "sessions": ["alpha", "gamma"]}]
+        ),
+    )
+
+    state = load_state()
+    state["active_view"] = "Work"
+    save_state(state)
+
+    response = client.get("/api/view")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["view"] == "Work"
+    assert data["views"] == ["all", "Work"]
+    names = {s["name"] for s in data["sessions"]}
+    assert names == {"alpha", "gamma"}
+
+
+def test_get_view_unknown_view_returns_empty_but_echoes_name(client, monkeypatch):
+    """GET /api/view with an active_view that matches no user view returns an
+    empty sessions list while still echoing the (unresolvable) view name."""
+    from muxplex.state import load_state, save_state
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+    monkeypatch.setattr("muxplex.main.load_settings", lambda: _view_settings())
+
+    state = load_state()
+    state["active_view"] = "Ghost"
+    save_state(state)
+
+    response = client.get("/api/view")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["view"] == "Ghost"
+    assert data["sessions"] == []
+
+
+def test_get_view_all_excludes_hidden_sessions(client, monkeypatch):
+    """GET /api/view for 'all' excludes sessions in settings.hidden_sessions."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha", "beta"])
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+    monkeypatch.setattr(
+        "muxplex.main.load_settings",
+        lambda: _view_settings(hidden_sessions=["beta"]),
+    )
+
+    response = client.get("/api/view")
+    assert response.status_code == 200
+    data = response.json()
+    names = [s["name"] for s in data["sessions"]]
+    assert names == ["alpha"]
+
+
+def test_get_view_views_list_excludes_hidden_reserved_name(client, monkeypatch):
+    """The 'views' list is 'all' + user views in settings order; 'hidden' never appears."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+    monkeypatch.setattr(
+        "muxplex.main.load_settings",
+        lambda: _view_settings(
+            views=[{"name": "Work", "sessions": []}, {"name": "Play", "sessions": []}]
+        ),
+    )
+
+    response = client.get("/api/view")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["views"] == ["all", "Work", "Play"]
+    assert "hidden" not in data["views"]
+
+
+def test_get_view_sort_omitted_alphabetical_setting_sorts_by_name(client, monkeypatch):
+    """When sort is omitted and settings.sort_order == 'alphabetical', sessions
+    are sorted by name and 'sort' echoes 'alphabetical'."""
+    monkeypatch.setattr(
+        "muxplex.main.get_session_list", lambda: ["zeta", "alpha", "mu"]
+    )
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+    monkeypatch.setattr(
+        "muxplex.main.load_settings",
+        lambda: _view_settings(sort_order="alphabetical"),
+    )
+
+    response = client.get("/api/view")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["sort"] == "alphabetical"
+    assert [s["name"] for s in data["sessions"]] == ["alpha", "mu", "zeta"]
+
+
+def test_get_view_sort_omitted_manual_setting_preserves_enumeration_order(
+    client, monkeypatch
+):
+    """When sort is omitted and settings.sort_order != 'alphabetical', the
+    /api/sessions enumeration order is preserved and 'sort' echoes 'server'."""
+    monkeypatch.setattr(
+        "muxplex.main.get_session_list", lambda: ["zeta", "alpha", "mu"]
+    )
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+    monkeypatch.setattr(
+        "muxplex.main.load_settings", lambda: _view_settings(sort_order="manual")
+    )
+
+    response = client.get("/api/view")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["sort"] == "server"
+    assert [s["name"] for s in data["sessions"]] == ["zeta", "alpha", "mu"]
+
+
+def test_get_view_bad_sort_value_returns_400(client, monkeypatch):
+    """GET /api/view?sort=bogus returns 400 (fail loud, no silent fallback)."""
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+    monkeypatch.setattr("muxplex.main.load_settings", lambda: _view_settings())
+
+    response = client.get("/api/view", params={"sort": "bogus"})
+    assert response.status_code == 400
+
+
+def test_get_view_sort_attention_bell_tier_ordered_by_last_fired_desc(
+    client, monkeypatch
+):
+    """?sort=attention puts needs_attention sessions first, freshest bell first."""
+    from muxplex.state import load_state, save_state
+
+    monkeypatch.setattr(
+        "muxplex.main.get_session_list", lambda: ["quiet", "older-bell", "newer-bell"]
+    )
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+    monkeypatch.setattr("muxplex.main.load_settings", lambda: _view_settings())
+
+    state = load_state()
+    state["sessions"]["older-bell"] = {
+        "bell": {"unseen_count": 1, "last_fired_at": 1000.0, "seen_at": None}
+    }
+    state["sessions"]["newer-bell"] = {
+        "bell": {"unseen_count": 1, "last_fired_at": 2000.0, "seen_at": None}
+    }
+    save_state(state)
+
+    response = client.get("/api/view", params={"sort": "attention"})
+    assert response.status_code == 200
+    data = response.json()
+    assert data["sort"] == "attention"
+    names = [s["name"] for s in data["sessions"]]
+    assert names[0] == "newer-bell"
+    assert names[1] == "older-bell"
+    assert names[2] == "quiet"
+    assert data["sessions"][0]["needs_attention"] is True
+    assert data["sessions"][1]["needs_attention"] is True
+    assert data["sessions"][2]["needs_attention"] is False
+
+
+def test_get_view_sort_attention_active_session_second_tier(client, monkeypatch):
+    """?sort=attention places the active session right after any bell tier,
+    ahead of plain recency-ordered sessions."""
+    from muxplex.state import load_state, save_state
+
+    monkeypatch.setattr(
+        "muxplex.main.get_session_list", lambda: ["recent", "active-one", "old"]
+    )
+    monkeypatch.setattr(
+        "muxplex.main.get_session_activity",
+        lambda: {"recent": 2000.0, "active-one": 500.0, "old": 100.0},
+    )
+    monkeypatch.setattr("muxplex.main.load_settings", lambda: _view_settings())
+
+    state = load_state()
+    state["active_session"] = "active-one"
+    save_state(state)
+
+    response = client.get("/api/view", params={"sort": "attention"})
+    assert response.status_code == 200
+    data = response.json()
+    names = [s["name"] for s in data["sessions"]]
+    # No bells fired -> tier 1 empty. active-one is tier 2 (first), then
+    # recency-ordered tier 3: recent (2000) before old (100).
+    assert names == ["active-one", "recent", "old"]
+    assert data["sessions"][0]["active"] is True
+
+
+def test_get_view_sort_attention_active_session_already_in_bell_tier_not_duplicated(
+    client, monkeypatch
+):
+    """If the active session also needs attention, it appears once (in tier 1),
+    not duplicated in tier 2."""
+    from muxplex.state import load_state, save_state
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["bell-and-active"])
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+    monkeypatch.setattr("muxplex.main.load_settings", lambda: _view_settings())
+
+    state = load_state()
+    state["active_session"] = "bell-and-active"
+    state["sessions"]["bell-and-active"] = {
+        "bell": {"unseen_count": 1, "last_fired_at": 1000.0, "seen_at": None}
+    }
+    save_state(state)
+
+    response = client.get("/api/view", params={"sort": "attention"})
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["sessions"]) == 1
+    assert data["sessions"][0]["name"] == "bell-and-active"
+    assert data["sessions"][0]["active"] is True
+    assert data["sessions"][0]["needs_attention"] is True
+
+
+def test_get_view_sort_attention_third_tier_recency_nulls_last(client, monkeypatch):
+    """?sort=attention orders the remaining (non-bell, non-active) sessions by
+    last_activity_at descending, with unknown activity (None) sorting last."""
+    monkeypatch.setattr(
+        "muxplex.main.get_session_list", lambda: ["no-activity", "old", "recent"]
+    )
+    monkeypatch.setattr(
+        "muxplex.main.get_session_activity",
+        lambda: {"old": 100.0, "recent": 2000.0},
+    )
+    monkeypatch.setattr("muxplex.main.load_settings", lambda: _view_settings())
+
+    response = client.get("/api/view", params={"sort": "attention"})
+    assert response.status_code == 200
+    data = response.json()
+    names = [s["name"] for s in data["sessions"]]
+    assert names == ["recent", "old", "no-activity"]
+
+
+def test_get_view_active_field_reflects_active_session(client, monkeypatch):
+    """The 'active' field on each session is True only for state.active_session."""
+    from muxplex.state import load_state, save_state
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["one", "two"])
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+    monkeypatch.setattr("muxplex.main.load_settings", lambda: _view_settings())
+
+    state = load_state()
+    state["active_session"] = "two"
+    save_state(state)
+
+    response = client.get("/api/view")
+    assert response.status_code == 200
+    data = response.json()
+    by_name = {s["name"]: s["active"] for s in data["sessions"]}
+    assert by_name == {"one": False, "two": True}
+
+
+def test_get_view_needs_attention_false_when_bell_already_seen(client, monkeypatch):
+    """needs_attention is False (via the endpoint) once seen_at >= last_fired_at."""
+    from muxplex.state import load_state, save_state
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["acked"])
+    monkeypatch.setattr("muxplex.main.get_session_activity", lambda: {})
+    monkeypatch.setattr("muxplex.main.load_settings", lambda: _view_settings())
+
+    state = load_state()
+    state["sessions"]["acked"] = {
+        "bell": {"unseen_count": 1, "last_fired_at": 1000.0, "seen_at": 2000.0}
+    }
+    save_state(state)
+
+    response = client.get("/api/view")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["sessions"][0]["needs_attention"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +965,108 @@ def test_connect_session_kills_existing_ttyd(client, monkeypatch):
     response = client.post("/api/sessions/alpha/connect")
     assert response.status_code == 200
     assert call_order == ["kill", ("spawn", "alpha")]
+
+
+def test_connect_same_active_session_short_circuits(client, monkeypatch):
+    """POST /connect to the already-active session with ttyd listening must NOT kill/respawn.
+
+    The PWA's follow-openSession and deck double-presses re-connect to the
+    session that is already active; kill+respawn there churns a healthy PTY
+    for ~300ms. With ttyd listening, the endpoint must return current state
+    immediately.
+    """
+    from muxplex.state import save_state
+
+    save_state(
+        {
+            "active_session": "alpha",
+            "session_order": ["alpha"],
+            "sessions": {},
+            "devices": {},
+        }
+    )
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+    monkeypatch.setattr("muxplex.main._ttyd_is_listening", lambda: True)
+
+    async def _fail_kill():
+        raise AssertionError("kill_ttyd must not run for a same-session connect")
+
+    async def _fail_spawn(name):
+        raise AssertionError("spawn_ttyd must not run for a same-session connect")
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", _fail_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", _fail_spawn)
+
+    response = client.post("/api/sessions/alpha/connect")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["active_session"] == "alpha"
+    assert data["ttyd_port"] == 7682
+
+
+def test_connect_same_active_session_respawns_when_ttyd_dead(client, monkeypatch):
+    """Same-session connect must still respawn when ttyd is NOT listening (restart safety)."""
+    from muxplex.state import save_state
+
+    save_state(
+        {
+            "active_session": "alpha",
+            "session_order": ["alpha"],
+            "sessions": {},
+            "devices": {},
+        }
+    )
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+    monkeypatch.setattr("muxplex.main._ttyd_is_listening", lambda: False)
+
+    call_order = []
+
+    async def mock_kill():
+        call_order.append("kill")
+        return True
+
+    async def mock_spawn(name):
+        call_order.append(("spawn", name))
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn)
+
+    response = client.post("/api/sessions/alpha/connect")
+    assert response.status_code == 200
+    assert call_order == ["kill", ("spawn", "alpha")]
+
+
+def test_connect_different_session_respawns_even_if_ttyd_listening(client, monkeypatch):
+    """A genuine switch (different session) must kill+respawn even with ttyd healthy."""
+    from muxplex.state import load_state, save_state
+
+    save_state(
+        {
+            "active_session": "alpha",
+            "session_order": ["alpha", "beta"],
+            "sessions": {},
+            "devices": {},
+        }
+    )
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha", "beta"])
+    monkeypatch.setattr("muxplex.main._ttyd_is_listening", lambda: True)
+
+    call_order = []
+
+    async def mock_kill():
+        call_order.append("kill")
+        return True
+
+    async def mock_spawn(name):
+        call_order.append(("spawn", name))
+
+    monkeypatch.setattr("muxplex.main.kill_ttyd", mock_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", mock_spawn)
+
+    response = client.post("/api/sessions/beta/connect")
+    assert response.status_code == 200
+    assert call_order == ["kill", ("spawn", "beta")]
+    assert load_state()["active_session"] == "beta"
 
 
 def test_connect_nonexistent_session_returns_404(client, monkeypatch):
@@ -794,6 +1430,141 @@ def test_lifespan_alert_bell_hook_discards_response(monkeypatch):
     # Check the first hook call
     hook_command = hook_calls[0][0][3]
     assert "-sfo /dev/null" in hook_command
+
+
+# ---------------------------------------------------------------------------
+# Bell hook self-healing (regression: startup registration used to fail
+# silently -- `except Exception: pass` -- and nothing ever retried it)
+# ---------------------------------------------------------------------------
+
+
+async def test_bell_hook_self_heals_after_startup_failure(monkeypatch):
+    """Regression test for the silently-dead bell hook.
+
+    The original bug: the startup call to `set-hook` could fail (tmux not up
+    yet at boot -- the *common* case, per the comment it left behind), the
+    failure was swallowed by a bare `except Exception: pass`, and nothing in
+    the poll loop ever re-registered it. Bells were then dead for the life of
+    the process with no error, no log, no signal.
+
+    A test that only asserted "_arm_bell_hook gets called" or that itself
+    called the recovery path would pass against the ORIGINAL broken code too
+    (which also called run_tmux once, just never again) -- exactly the trap
+    that let `test_audit_log_line_present_and_redacted` stay green for weeks
+    while the audit log emitted nothing. This test instead:
+
+      1. Forces the startup-equivalent call to genuinely fail.
+      2. Asserts the module is left in a genuinely unarmed state as a
+         *result* of that real failure -- not a mocked assertion.
+      3. Runs a REAL `_run_poll_cycle()` (production's own retry path, not a
+         second manual call this test makes itself) with tmux available
+         again, and proves THAT heals it.
+
+    Against the pre-fix code this test fails at step 3: nothing in
+    `_run_poll_cycle` ever called `run_tmux` for the hook, so `call_count`
+    would stay at 1 and the hook would never be proven armed.
+    """
+    from unittest.mock import AsyncMock
+
+    import muxplex.main as main_mod
+
+    # Start from a genuinely-unarmed state (a prior test may have left
+    # module-level state armed).
+    monkeypatch.setattr(main_mod, "_bell_hook_armed", False)
+    monkeypatch.setattr(main_mod, "_bell_hook_last_error", None)
+
+    # First call (the startup-equivalent) fails, simulating "tmux not up yet
+    # at boot"; second call (inside the poll cycle, tmux now up) succeeds.
+    mock_run_tmux = AsyncMock(
+        side_effect=[RuntimeError("no server running on /tmp/tmux-0/default"), ""]
+    )
+    monkeypatch.setattr(main_mod, "run_tmux", mock_run_tmux)
+
+    # Step 1: the real startup call must genuinely fail here.
+    startup_result = await main_mod._arm_bell_hook()
+    assert startup_result is False
+    assert main_mod._bell_hook_armed is False
+    assert main_mod._bell_hook_last_error is not None
+    assert mock_run_tmux.call_count == 1
+
+    # Step 2: drive a REAL poll cycle. Everything else it touches is mocked
+    # out to isolate the hook-arming behavior -- crucially, the self-healing
+    # check inside _run_poll_cycle itself is NOT mocked.
+    async def mock_enumerate():
+        return []
+
+    async def mock_snapshot_all(names):
+        return {}
+
+    monkeypatch.setattr(main_mod, "enumerate_sessions", mock_enumerate)
+    monkeypatch.setattr(main_mod, "snapshot_all", mock_snapshot_all)
+    monkeypatch.setattr(main_mod, "update_session_cache", lambda names, snapshots: None)
+    monkeypatch.setattr(main_mod, "process_bell_flags", AsyncMock())
+    monkeypatch.setattr(main_mod, "apply_bell_clear_rule", lambda state: None)
+    monkeypatch.setattr(main_mod, "prune_devices", lambda state: None)
+
+    await main_mod._run_poll_cycle()
+
+    # The poll cycle's self-healing retry is what fixed it.
+    assert mock_run_tmux.call_count == 2, (
+        "expected _run_poll_cycle to retry bell-hook registration while unarmed"
+    )
+    assert main_mod._bell_hook_armed is True
+    assert main_mod._bell_hook_last_error is None
+
+
+async def test_bell_hook_not_retried_once_armed(monkeypatch):
+    """Once armed, `_run_poll_cycle()` must NOT call tmux again every cycle.
+
+    This is the other half of the design constraint: self-healing must not
+    become an unconditional per-cycle `tmux set-hook` call -- a subprocess
+    every ~2s for the life of the process to re-set something already set.
+    """
+    from unittest.mock import AsyncMock
+
+    import muxplex.main as main_mod
+
+    monkeypatch.setattr(main_mod, "_bell_hook_armed", True)
+    monkeypatch.setattr(main_mod, "_bell_hook_last_error", None)
+
+    mock_run_tmux = AsyncMock(return_value="")
+    monkeypatch.setattr(main_mod, "run_tmux", mock_run_tmux)
+
+    async def mock_enumerate():
+        return []
+
+    async def mock_snapshot_all(names):
+        return {}
+
+    monkeypatch.setattr(main_mod, "enumerate_sessions", mock_enumerate)
+    monkeypatch.setattr(main_mod, "snapshot_all", mock_snapshot_all)
+    monkeypatch.setattr(main_mod, "update_session_cache", lambda names, snapshots: None)
+    monkeypatch.setattr(main_mod, "process_bell_flags", AsyncMock())
+    monkeypatch.setattr(main_mod, "apply_bell_clear_rule", lambda state: None)
+    monkeypatch.setattr(main_mod, "prune_devices", lambda state: None)
+
+    await main_mod._run_poll_cycle()
+
+    assert mock_run_tmux.call_count == 0, (
+        "an already-armed hook must not be re-registered every poll cycle"
+    )
+    assert main_mod._bell_hook_armed is True
+
+
+def test_instance_info_reports_bell_hook_armed(client, monkeypatch):
+    """GET /api/instance-info surfaces bell_hook_armed, so a dead hook is
+    observable without grepping logs -- the previous `except Exception: pass`
+    left no externally-visible signal at all."""
+    import muxplex.main as main_mod
+
+    monkeypatch.setattr(main_mod, "_bell_hook_armed", False)
+    response = client.get("/api/instance-info")
+    assert response.status_code == 200
+    assert response.json()["bell_hook_armed"] is False
+
+    monkeypatch.setattr(main_mod, "_bell_hook_armed", True)
+    response = client.get("/api/instance-info")
+    assert response.json()["bell_hook_armed"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -1221,6 +1992,114 @@ def test_patch_settings_ignores_unknown_keys(client, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# PATCH /api/settings -- expected_settings_updated_at (optimistic concurrency)
+# ---------------------------------------------------------------------------
+
+
+def test_patch_settings_cas_omitted_behaves_as_before(client, tmp_path, monkeypatch):
+    """Omitting expected_settings_updated_at is fully backward compatible: 200, write applies."""
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+
+    response = client.patch("/api/settings", json={"sort_order": "alphabetical"})
+    assert response.status_code == 200
+    assert response.json()["sort_order"] == "alphabetical"
+
+
+def test_patch_settings_cas_match_applies_write(client, tmp_path, monkeypatch):
+    """A correct expected_settings_updated_at (matching current) returns 200 and applies the write."""
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+
+    current_ts = client.get("/api/settings").json()["settings_updated_at"]
+
+    response = client.patch(
+        "/api/settings",
+        json={
+            "sort_order": "alphabetical",
+            "expected_settings_updated_at": current_ts,
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["sort_order"] == "alphabetical"
+
+
+def test_patch_settings_cas_mismatch_returns_409_no_write(
+    client, tmp_path, monkeypatch
+):
+    """A stale expected_settings_updated_at returns 409 and makes NO write."""
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+
+    # Bump settings_updated_at once so the "current" timestamp is nonzero,
+    # then attempt a PATCH with a deliberately stale (older) expectation.
+    client.patch("/api/settings", json={"sort_order": "alphabetical"})
+    stale_ts = -1.0  # guaranteed not to equal the real settings_updated_at
+
+    response = client.patch(
+        "/api/settings",
+        json={
+            "sort_order": "recent",
+            "expected_settings_updated_at": stale_ts,
+        },
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert "settings_updated_at" in body
+
+    # No write happened: sort_order must still be the prior value, not "recent".
+    after = client.get("/api/settings").json()
+    assert after["sort_order"] == "alphabetical"
+
+
+def test_patch_settings_cas_response_includes_current_timestamp(
+    client, tmp_path, monkeypatch
+):
+    """A 409 response body's settings_updated_at equals the server's actual current value."""
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+
+    real_ts = client.get("/api/settings").json()["settings_updated_at"]
+
+    response = client.patch(
+        "/api/settings",
+        json={"sort_order": "recent", "expected_settings_updated_at": real_ts - 1.0},
+    )
+    assert response.status_code == 409
+    assert response.json()["settings_updated_at"] == real_ts
+
+
+def test_patch_settings_cas_field_not_written_as_a_setting(
+    client, tmp_path, monkeypatch
+):
+    """expected_settings_updated_at never leaks into the persisted/response settings."""
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+
+    current_ts = client.get("/api/settings").json()["settings_updated_at"]
+    response = client.patch(
+        "/api/settings",
+        json={
+            "sort_order": "alphabetical",
+            "expected_settings_updated_at": current_ts,
+        },
+    )
+    assert response.status_code == 200
+    assert "expected_settings_updated_at" not in response.json()
+
+    import json as json_mod
+
+    on_disk = json_mod.loads(settings_path.read_text())
+    assert "expected_settings_updated_at" not in on_disk
+
+
+# ---------------------------------------------------------------------------
 # GET /api/instance-info
 # ---------------------------------------------------------------------------
 
@@ -1329,6 +2208,39 @@ def test_instance_info_federation_enabled_true_when_key_exists(
     )
 
 
+def test_instance_info_includes_tmux_socket_dir_configured(
+    client, tmp_path, monkeypatch
+):
+    """GET /api/instance-info returns the configured tmux_socket_dir value verbatim."""
+    import json as json_mod
+
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    settings_path.write_text(
+        json_mod.dumps({"tmux_socket_dir": "/custom/tmux/socket/dir"})
+    )
+
+    response = client.get("/api/instance-info")
+    assert response.status_code == 200
+    assert response.json()["tmux_socket_dir"] == "/custom/tmux/socket/dir"
+
+
+def test_instance_info_tmux_socket_dir_falls_back_when_unset(
+    client, tmp_path, monkeypatch
+):
+    """With tmux_socket_dir unset, instance-info still returns a non-empty resolved path."""
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.delenv("TMUX_TMPDIR", raising=False)
+
+    response = client.get("/api/instance-info")
+    assert response.status_code == 200
+    assert response.json()["tmux_socket_dir"]  # non-empty fallback, never ""
+
+
 def test_instance_info_includes_device_id(client, tmp_path, monkeypatch):
     """GET /api/instance-info includes device_id as a non-empty string."""
     import muxplex.identity as identity_mod
@@ -1346,6 +2258,114 @@ def test_instance_info_includes_device_id(client, tmp_path, monkeypatch):
     )
     assert data["device_id"] != "", (
         f"device_id must be a non-empty string, got: {data['device_id']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/ca
+# ---------------------------------------------------------------------------
+
+
+def test_ca_endpoint_returns_pem_when_ca_present(client, tmp_path, monkeypatch):
+    """GET /api/ca returns 200, the CA PEM, correct content-type, never a private key."""
+    import muxplex.settings as settings_mod
+    from muxplex.tls import generate_local_ca
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+    ca_cert_path = tmp_path / "ca" / "muxplex-ca.crt"
+    ca_key_path = tmp_path / "ca" / "muxplex-ca.key"
+    generate_local_ca(ca_cert_path, ca_key_path)
+
+    response = client.get("/api/ca")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/x-pem-file")
+    body = response.content
+    assert b"BEGIN CERTIFICATE" in body, (
+        f"Response body must contain a PEM certificate, got: {body[:80]!r}"
+    )
+    assert b"PRIVATE KEY" not in body, (
+        "Response must NEVER include private key material"
+    )
+
+
+def test_ca_endpoint_404_when_no_ca_configured(client, tmp_path, monkeypatch):
+    """GET /api/ca returns 404 with a helpful detail when no local CA exists."""
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+
+    response = client.get("/api/ca")
+    assert response.status_code == 404
+    detail = response.json().get("detail", "")
+    assert detail, "404 response must include a non-empty, helpful 'detail' message"
+
+
+def test_ca_endpoint_no_auth_required(tmp_path, monkeypatch):
+    """GET /api/ca returns 200 even without an auth cookie/credentials."""
+    import muxplex.settings as settings_mod
+    from muxplex.tls import generate_local_ca
+
+    monkeypatch.setenv("MUXPLEX_PASSWORD", "test-password")
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+    ca_cert_path = tmp_path / "ca" / "muxplex-ca.crt"
+    ca_key_path = tmp_path / "ca" / "muxplex-ca.key"
+    generate_local_ca(ca_cert_path, ca_key_path)
+
+    with TestClient(app) as c:
+        # No auth cookie set — endpoint must be accessible without one.
+        response = c.get("/api/ca")
+    assert response.status_code == 200
+    assert b"BEGIN CERTIFICATE" in response.content
+
+
+def test_ca_endpoint_404_for_leaf_not_ca(client, tmp_path, monkeypatch):
+    """GET /api/ca returns 404 (never serves the file) when a non-CA leaf cert sits at the CA path."""
+    import muxplex.settings as settings_mod
+    from muxplex.tls import generate_self_signed
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+    ca_dir = tmp_path / "ca"
+    ca_dir.mkdir(parents=True)
+    # A plain self-signed leaf has no BasicConstraints CA:TRUE — wrong content
+    # accidentally left at the CA path.
+    leaf_cert_path = ca_dir / "muxplex-ca.crt"
+    leaf_key_path = ca_dir / "leaf-only.key"
+    generate_self_signed(leaf_cert_path, leaf_key_path)
+
+    response = client.get("/api/ca")
+    assert response.status_code == 404
+
+
+def test_ca_endpoint_ignores_query_params(client, tmp_path, monkeypatch):
+    """No query parameter can redirect the read — the endpoint takes no request input at all."""
+    import muxplex.settings as settings_mod
+    from muxplex.tls import generate_local_ca
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+    ca_cert_path = tmp_path / "ca" / "muxplex-ca.crt"
+    ca_key_path = tmp_path / "ca" / "muxplex-ca.key"
+    generate_local_ca(ca_cert_path, ca_key_path)
+    expected_body = ca_cert_path.read_bytes()
+
+    # Attempted path-traversal / arbitrary-file-read style query params must
+    # be silently ignored — same CA is served regardless.
+    response = client.get(
+        "/api/ca", params={"path": "/etc/passwd", "file": "../../../etc/passwd"}
+    )
+    assert response.status_code == 200
+    assert response.content == expected_body
+
+
+def test_ca_endpoint_handler_accepts_no_parameters():
+    """The handler itself takes no parameters — the structural guarantee that
+    no request input (path/query/body/header) can reach the filesystem read."""
+    import inspect
+
+    from muxplex.main import get_ca_certificate
+
+    sig = inspect.signature(get_ca_certificate)
+    assert len(sig.parameters) == 0, (
+        f"get_ca_certificate must take zero parameters, got: {list(sig.parameters)}"
     )
 
 
@@ -1481,6 +2501,238 @@ def test_delete_session_not_found(client, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Security: session-name allowlist, fail-closed gate, injection defense
+#
+# Regression guards for the live remote-code-execution hardening:
+#   1. create/delete substituted a client-supplied name into a shell command
+#      with only a .strip() -- `name="x; touch FILE; true"` executed FILE.
+#   2. delete had no name validator at all (the wider hole).
+#   3. the known-session gate (`if known and name not in known`) failed OPEN
+#      whenever the session cache was empty -- the guard evaporated exactly
+#      when the system was least healthy.
+# ---------------------------------------------------------------------------
+
+
+def test_create_session_rejects_shell_injection(client, monkeypatch):
+    """POST /api/sessions rejects an injection payload with 400 and never spawns."""
+    from unittest.mock import AsyncMock
+
+    spawned = AsyncMock()
+    monkeypatch.setattr("muxplex.main.asyncio.create_subprocess_shell", spawned)
+
+    response = client.post(
+        "/api/sessions", json={"name": "x; touch /tmp/deckdev-should-not-exist; true"}
+    )
+
+    assert response.status_code == 400
+    assert spawned.call_count == 0, (
+        "create_subprocess_shell must NOT run when the name fails the allowlist"
+    )
+
+
+def test_delete_session_rejects_shell_injection(client, monkeypatch):
+    """DELETE /api/sessions/{name} rejects an injection payload with 400 and never runs."""
+    from unittest.mock import MagicMock, patch
+
+    # A populated cache proves the 400 is the allowlist, not the fail-closed gate.
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha"])
+    run = MagicMock()
+
+    # Note: DELETE takes the name as a path segment, so `/` can't appear here --
+    # the injection surface is the remaining shell metacharacters (`;`, spaces).
+    with patch("muxplex.main.subprocess.run", run):
+        response = client.delete("/api/sessions/x;%20id;%20true")
+
+    assert response.status_code == 400
+    assert run.call_count == 0, (
+        "subprocess.run must NOT run when the name fails the allowlist"
+    )
+
+
+def test_create_session_rejects_invalid_charset(client, monkeypatch):
+    """POST /api/sessions rejects names with spaces/metacharacters (400), not a subprocess."""
+    from unittest.mock import AsyncMock
+
+    spawned = AsyncMock()
+    monkeypatch.setattr("muxplex.main.asyncio.create_subprocess_shell", spawned)
+
+    for bad in ["has space", "back`tick`", "pipe|it", "dollar$ign", "a" * 65, "co:lon"]:
+        response = client.post("/api/sessions", json={"name": bad})
+        assert response.status_code == 400, f"expected 400 for {bad!r}"
+    assert spawned.call_count == 0
+
+
+def test_create_and_delete_accept_ordinary_names(client, monkeypatch, tmp_path):
+    """Valid names (letters/digits/_.-) still create and delete normally."""
+    import json
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    settings_path.write_text(json.dumps({"new_session_template": "echo {name}"}))
+
+    proc = MagicMock()
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.returncode = 0
+    monkeypatch.setattr(
+        "muxplex.main.asyncio.create_subprocess_shell", AsyncMock(return_value=proc)
+    )
+
+    # Representative of real live session names (dots, underscores, hyphens).
+    for name in ["amplifier-wiki", "a2a", "my_project.v2", "AAA-claw"]:
+        resp = client.post("/api/sessions", json={"name": name})
+        assert resp.status_code == 200, f"valid name {name!r} must be accepted"
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["amplifier-wiki"])
+    run_result = MagicMock()
+    run_result.returncode = 0
+    run_result.stderr = ""
+    with patch("muxplex.main.subprocess.run", return_value=run_result):
+        resp = client.delete("/api/sessions/amplifier-wiki")
+    assert resp.status_code == 200
+
+
+def test_delete_session_fails_closed_on_empty_cache(client, monkeypatch):
+    """DELETE rejects (404) when the session cache is empty -- never allow-through."""
+    from unittest.mock import MagicMock, patch
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    run = MagicMock()
+
+    with patch("muxplex.main.subprocess.run", run):
+        response = client.delete("/api/sessions/alpha")
+
+    assert response.status_code == 404, (
+        "empty cache must fail closed, not allow the delete through"
+    )
+    assert run.call_count == 0, "no subprocess may run when the target is unknown"
+
+
+def test_connect_session_fails_closed_on_empty_cache(client, monkeypatch):
+    """POST connect rejects (404) when the session cache is empty -- never allow-through."""
+
+    async def _fail_kill():
+        raise AssertionError("kill_ttyd must not run when target is unknown")
+
+    async def _fail_spawn(name):
+        raise AssertionError("spawn_ttyd must not run when target is unknown")
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    monkeypatch.setattr("muxplex.main.kill_ttyd", _fail_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", _fail_spawn)
+
+    response = client.post("/api/sessions/alpha/connect")
+    assert response.status_code == 404
+
+
+def test_delete_session_exact_match_not_prefix(client, monkeypatch):
+    """DELETE 'foo' with only 'foobar' known must 404 (no tmux -t prefix match)."""
+    from unittest.mock import MagicMock, patch
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["foobar"])
+    run = MagicMock()
+
+    with patch("muxplex.main.subprocess.run", run):
+        response = client.delete("/api/sessions/foo")
+
+    assert response.status_code == 404
+    assert run.call_count == 0
+
+
+def test_connect_session_exact_match_not_prefix(client, monkeypatch):
+    """POST connect 'foo' with only 'foobar' known must 404 (exact membership)."""
+
+    async def _fail_kill():
+        raise AssertionError("kill_ttyd must not run for a prefix-only match")
+
+    async def _fail_spawn(name):
+        raise AssertionError("spawn_ttyd must not run for a prefix-only match")
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["foobar"])
+    monkeypatch.setattr("muxplex.main.kill_ttyd", _fail_kill)
+    monkeypatch.setattr("muxplex.main.spawn_ttyd", _fail_spawn)
+
+    response = client.post("/api/sessions/foo/connect")
+    assert response.status_code == 404
+
+
+def test_delete_session_shlex_quote_defense_in_depth(client, monkeypatch, tmp_path):
+    """If the allowlist is ever loosened, shlex.quote() still neutralizes the name.
+
+    Simulates a regressed allowlist by forcing is_valid_session_name True, then
+    proves the substituted name is shlex-quoted (metacharacters inert) in the
+    shell command that would run.
+    """
+    import shlex
+    from unittest.mock import MagicMock, patch
+
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "no-settings.json")
+    monkeypatch.setattr("muxplex.main.is_valid_session_name", lambda name: True)
+
+    # No `/` -- the name is a DELETE path segment. `;` and spaces are the shell
+    # metacharacters we prove shlex.quote() neutralizes.
+    payload = "x; id; true"
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [payload])
+
+    captured = []
+
+    def mock_run(cmd, **kwargs):
+        captured.append(cmd)
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = ""
+        return result
+
+    with patch("muxplex.main.subprocess.run", side_effect=mock_run):
+        client.delete(f"/api/sessions/{payload}")
+
+    assert len(captured) == 1
+    assert shlex.quote(payload) in captured[0], (
+        f"delete must shlex.quote the substituted name, got: {captured[0]!r}"
+    )
+    # The raw, unquoted metacharacter sequence must NOT appear un-neutralized.
+    assert f"-t {payload}" not in captured[0]
+
+
+def test_create_session_shlex_quote_defense_in_depth(client, monkeypatch, tmp_path):
+    """If the allowlist is ever loosened, create still shlex.quotes the name."""
+    import json
+    import shlex
+    from unittest.mock import AsyncMock, MagicMock
+
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    settings_path.write_text(json.dumps({"new_session_template": "echo {name}"}))
+    monkeypatch.setattr("muxplex.main.is_valid_session_name", lambda name: True)
+
+    proc = MagicMock()
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.returncode = 0
+
+    captured = []
+
+    async def mock_shell(cmd, **kwargs):
+        captured.append(cmd)
+        return proc
+
+    monkeypatch.setattr("muxplex.main.asyncio.create_subprocess_shell", mock_shell)
+
+    payload = "x; touch /tmp/deckdev-quote; true"
+    resp = client.post("/api/sessions", json={"name": payload})
+    assert resp.status_code == 200
+    assert len(captured) == 1
+    assert shlex.quote(payload) in captured[0], (
+        f"create must shlex.quote the substituted name, got: {captured[0]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Issue 1: Static assets exempt from auth middleware
 # ---------------------------------------------------------------------------
 
@@ -1507,6 +2759,48 @@ def test_css_asset_accessible_from_non_localhost_without_auth(monkeypatch):
     assert response.status_code == 200, (
         f"Expected 200 for CSS from non-localhost, got {response.status_code}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Frontend cache policy: no-cache (forced revalidation) on frontend responses
+# ---------------------------------------------------------------------------
+
+
+def test_frontend_responses_carry_no_cache_header(client):
+    """Frontend responses (app shell + static assets) must carry
+    Cache-Control: no-cache so installed PWAs revalidate on every load
+    instead of serving stale JS across deploys. With ETag/Last-Modified
+    this costs a cheap 304 when nothing changed."""
+    for path in ("/", "/index.html", "/app.js", "/style.css"):
+        response = client.get(path)
+        assert response.status_code == 200, f"GET {path} -> {response.status_code}"
+        assert response.headers.get("cache-control") == "no-cache", (
+            f"GET {path}: expected 'Cache-Control: no-cache', "
+            f"got {response.headers.get('cache-control')!r}"
+        )
+
+
+def test_api_responses_do_not_carry_no_cache_header(client):
+    """/api responses must NOT be affected by the frontend cache policy."""
+    response = client.get("/api/state")
+    assert response.status_code == 200
+    assert "no-cache" not in response.headers.get("cache-control", ""), (
+        f"/api/state unexpectedly carries "
+        f"Cache-Control: {response.headers.get('cache-control')!r}"
+    )
+
+
+def test_startup_logs_frontend_identity(caplog):
+    """Lifespan startup emits one line identifying the served app.js
+    (short md5) so 'which JS is this server serving?' is a glance."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="muxplex.main"):
+        with TestClient(app):
+            pass
+    assert any(
+        "frontend: app.js " in record.getMessage() for record in caplog.records
+    ), "expected startup log line 'frontend: app.js <md5-8>'"
 
 
 # ---------------------------------------------------------------------------
@@ -2094,6 +3388,200 @@ def test_federation_sessions_includes_remote_failure_status(
 
 
 # ---------------------------------------------------------------------------
+# Federation circuit breaker (dead remote must not lag every fan-out)
+# ---------------------------------------------------------------------------
+
+
+def _write_single_remote_settings(settings_path, url="http://dead-host:9"):
+    import json
+
+    settings_path.write_text(
+        json.dumps(
+            {
+                "device_name": "local-host",
+                "remote_instances": [
+                    {"url": url, "key": "abc123", "name": "dead-host"}
+                ],
+            }
+        )
+    )
+
+
+def test_federation_circuit_breaker_skips_dead_remote_after_threshold(
+    client, monkeypatch, tmp_path, caplog
+):
+    """After 3 consecutive connection failures (the grace window) the dead
+    remote is SKIPPED: no network call is made, the honest 'unreachable' entry
+    is still returned, and the circuit-open transition is logged exactly once."""
+    import logging
+
+    import httpx
+
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    _write_single_remote_settings(settings_path)
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {})
+
+    from unittest.mock import MagicMock
+
+    # Count only /api/sessions attempts -- the breaker gates the SESSIONS poll.
+    # fetch_remote also makes a concurrent, independent /api/instance-info
+    # probe (for deviceVersion) that this test isn't about; it fails the same
+    # way (ConnectError) and is swallowed by _fetch_remote_version regardless.
+    call_count = 0
+
+    async def mock_get(url, **kwargs):
+        nonlocal call_count
+        if url.endswith("/api/sessions"):
+            call_count += 1
+        raise httpx.ConnectError("Connection refused")
+
+    mock_client = MagicMock()
+    mock_client.get = mock_get
+    monkeypatch.setattr(client.app.state, "federation_client", mock_client)
+
+    with caplog.at_level(logging.WARNING, logger="muxplex.main"):
+        # Requests 1-3: real attempts (failures count toward the breaker;
+        # threshold matches the _FEDERATION_GRACE_FAILURES window of 3)
+        for _ in range(3):
+            response = client.get("/api/federation/sessions")
+            assert response.status_code == 200
+        assert call_count == 3
+
+        # Requests 4-6: circuit open — NO further network calls
+        for _ in range(3):
+            response = client.get("/api/federation/sessions")
+            assert response.status_code == 200
+            data = response.json()
+            entries = [s for s in data if s.get("status") == "unreachable"]
+            assert len(entries) == 1, (
+                f"Circuit-open remote must still appear as unreachable, got: {data}"
+            )
+        assert call_count == 3, (
+            f"Open circuit must skip the network call entirely, "
+            f"but the client was called {call_count} times"
+        )
+
+    open_logs = [r for r in caplog.records if "unreachable; skipping" in r.getMessage()]
+    assert len(open_logs) == 1, (
+        f"Circuit-open must be logged exactly once (no per-poll spam), "
+        f"got {len(open_logs)}: {[r.getMessage() for r in open_logs]}"
+    )
+
+
+def test_federation_reachable_error_remote_is_never_circuit_broken(
+    client, monkeypatch, tmp_path
+):
+    """A remote that RESPONDS with an auth error is reachable: it must keep
+    being polled (no circuit break) and keep reporting its honest auth_failed
+    status on every request."""
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    _write_single_remote_settings(settings_path, url="http://badkey-host:8088")
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {})
+
+    from unittest.mock import MagicMock
+
+    # Count only /api/sessions attempts -- see the sibling breaker test above
+    # for why the concurrent /api/instance-info version probe isn't counted.
+    call_count = 0
+
+    async def mock_get(url, **kwargs):
+        nonlocal call_count
+        if url.endswith("/api/sessions"):
+            call_count += 1
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        return mock_resp
+
+    mock_client = MagicMock()
+    mock_client.get = mock_get
+    monkeypatch.setattr(client.app.state, "federation_client", mock_client)
+
+    for i in range(4):
+        response = client.get("/api/federation/sessions")
+        assert response.status_code == 200
+        data = response.json()
+        entries = [s for s in data if s.get("status") == "auth_failed"]
+        assert len(entries) == 1, (
+            f"Request {i + 1}: reachable-but-erroring remote must still be "
+            f"reported as auth_failed, got: {data}"
+        )
+    assert call_count == 4, (
+        f"Reachable remote must be polled on every request (never circuit-broken), "
+        f"expected 4 calls, got {call_count}"
+    )
+
+
+def test_federation_circuit_breaker_recovers_after_cooldown(
+    client, monkeypatch, tmp_path
+):
+    """End-to-end recovery: circuit opens on a dead remote, then after the
+    cooldown a half-open probe succeeds and the remote's sessions reappear."""
+    import httpx
+
+    import muxplex.main as main_mod
+    import muxplex.settings as settings_mod
+    from muxplex.breaker import CircuitBreaker
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    _write_single_remote_settings(settings_path, url="http://flaky-host:8088")
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {})
+
+    # Deterministic clock so the test doesn't sleep through a real cooldown
+    fake_now = [1000.0]
+    breaker = CircuitBreaker(threshold=2, cooldown=60.0, clock=lambda: fake_now[0])
+    monkeypatch.setattr(main_mod, "_federation_breaker", breaker)
+
+    from unittest.mock import MagicMock
+
+    remote_up = [False]
+
+    async def mock_get(url, **kwargs):
+        if not remote_up[0]:
+            raise httpx.ConnectError("Connection refused")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: [{"name": "revived", "snapshot": "", "bell": {}}]
+        return mock_resp
+
+    mock_client = MagicMock()
+    mock_client.get = mock_get
+    monkeypatch.setattr(client.app.state, "federation_client", mock_client)
+
+    # Open the circuit
+    client.get("/api/federation/sessions")
+    client.get("/api/federation/sessions")
+    assert breaker.is_open("http://flaky-host:8088")
+
+    # Remote comes back up; cooldown elapses; half-open probe succeeds
+    remote_up[0] = True
+    fake_now[0] += 61.0
+    response = client.get("/api/federation/sessions")
+    assert response.status_code == 200
+    data = response.json()
+    names = [s.get("name") for s in data]
+    assert "revived" in names, (
+        f"After recovery the remote's sessions must reappear, got: {data}"
+    )
+    assert not breaker.is_open("http://flaky-host:8088"), (
+        "Successful half-open probe must close the circuit"
+    )
+
+
+# ---------------------------------------------------------------------------
 # POST /api/federation/{remote_id}/connect/{session_name} (task-12)
 # ---------------------------------------------------------------------------
 
@@ -2425,6 +3913,103 @@ def test_delete_session_passes_stdin_y_to_subprocess(client, monkeypatch, tmp_pa
     )
     assert kwargs["input"] == "y\n", (
         f"input must be 'y\\n' to confirm deletion, got: {kwargs['input']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bug fix: create_session/delete_session must honor tmux_socket_dir (tmux_env())
+# ---------------------------------------------------------------------------
+#
+# When muxplex runs as a systemd/launchd service, its process environment does
+# NOT include TMUX_TMPDIR even if the user's interactive shell sets it (e.g. to
+# keep tmux sockets out of the shared, world-writable /tmp). run_tmux() in
+# sessions.py already compensates for this via tmux_env(). These two endpoints
+# spawn user-configured command templates (which often invoke external tools
+# like `amplifier-workspace` that call bare `tmux` themselves) and must pass the
+# same env, or those subprocess-spawned tmux calls silently target the default
+# socket (/tmp/tmux-$UID) instead of the configured tmux_socket_dir -- making
+# newly created sessions invisible to muxplex, and deletes silent no-ops
+# against the real running session.
+
+
+def test_create_session_passes_tmux_env_to_subprocess(client, monkeypatch, tmp_path):
+    """POST /api/sessions must pass tmux_env() as env= to create_subprocess_shell.
+
+    Regression guard: without this, a custom tmux_socket_dir setting is
+    silently ignored by whatever tmux calls the session command template makes,
+    so sessions created via this endpoint can end up on a different tmux socket
+    than the one muxplex itself reads from (enumerate_sessions/capture_pane).
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "no-settings.json")
+
+    sentinel_env = {"TMUX_TMPDIR": "/custom/tmux/socket/dir", "SENTINEL": "1"}
+    monkeypatch.setattr("muxplex.main.tmux_env", lambda: sentinel_env)
+
+    captured_kwargs = []
+
+    mock_proc = MagicMock()
+    mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+    mock_proc.returncode = 0
+
+    async def mock_create_subprocess(cmd, **kwargs):
+        captured_kwargs.append(kwargs)
+        return mock_proc
+
+    monkeypatch.setattr(
+        "muxplex.main.asyncio.create_subprocess_shell", mock_create_subprocess
+    )
+
+    response = client.post("/api/sessions", json={"name": "env-check"})
+    assert response.status_code == 200
+
+    assert len(captured_kwargs) == 1, (
+        "create_subprocess_shell must be called exactly once"
+    )
+    assert captured_kwargs[0].get("env") == sentinel_env, (
+        "create_session must pass env=tmux_env() to create_subprocess_shell, "
+        f"got env={captured_kwargs[0].get('env')!r}"
+    )
+
+
+def test_delete_session_passes_tmux_env_to_subprocess(client, monkeypatch, tmp_path):
+    """DELETE /api/sessions/{name} must pass tmux_env() as env= to subprocess.run.
+
+    Regression guard: without this, the delete command (which may itself
+    invoke `tmux kill-session` or an external tool that does) silently targets
+    the default tmux socket instead of the configured tmux_socket_dir --
+    causing the real session to survive while muxplex reports it as deleted.
+    """
+    from unittest.mock import MagicMock, patch
+
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["my-session"])
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "no-settings.json")
+
+    sentinel_env = {"TMUX_TMPDIR": "/custom/tmux/socket/dir", "SENTINEL": "1"}
+    monkeypatch.setattr("muxplex.main.tmux_env", lambda: sentinel_env)
+
+    captured_kwargs = []
+
+    def mock_run(cmd, **kwargs):
+        captured_kwargs.append(kwargs)
+        result = MagicMock()
+        result.returncode = 0
+        result.stderr = ""
+        return result
+
+    with patch("muxplex.main.subprocess.run", side_effect=mock_run):
+        response = client.delete("/api/sessions/my-session")
+
+    assert response.status_code == 200
+    assert len(captured_kwargs) == 1, "subprocess.run must be called exactly once"
+    assert captured_kwargs[0].get("env") == sentinel_env, (
+        "delete_session must pass env=tmux_env() to subprocess.run, "
+        f"got env={captured_kwargs[0].get('env')!r}"
     )
 
 
@@ -3257,6 +4842,179 @@ def test_put_settings_sync_ignores_nonsyncable_keys(client, tmp_path, monkeypatc
 
 
 # ---------------------------------------------------------------------------
+# Destructive-write backstop (settings clobber incident, 2026-07)
+# ---------------------------------------------------------------------------
+
+
+def _views(n, sessions_per_view=2):
+    return [
+        {"name": f"v{i}", "sessions": [f"s{i}-{j}" for j in range(sessions_per_view)]}
+        for i in range(n)
+    ]
+
+
+def test_patch_settings_rejects_destructive_views_collapse_via_api(
+    client, tmp_path, monkeypatch
+):
+    """PATCH /api/settings with an 8->1 views collapse returns 409, no write."""
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+    client.patch("/api/settings", json={"views": _views(8)})
+
+    response = client.patch("/api/settings", json={"views": [_views(8)[0]]})
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["backstop"] is True
+    assert "counts" in body
+    assert body["counts"]["before_views"] == 8
+    assert body["counts"]["after_views"] == 1
+
+    # No write happened.
+    after = client.get("/api/settings").json()
+    assert len(after["views"]) == 8
+
+
+def test_patch_settings_allow_destructive_true_permits_collapse_via_api(
+    client, tmp_path, monkeypatch
+):
+    """PATCH /api/settings with allow_destructive: true permits an intentional collapse."""
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+    client.patch("/api/settings", json={"views": _views(8)})
+
+    response = client.patch(
+        "/api/settings",
+        json={"views": [_views(8)[0]], "allow_destructive": True},
+    )
+
+    assert response.status_code == 200
+    assert len(response.json()["views"]) == 1
+
+
+def test_patch_settings_single_view_deletion_via_api_is_unaffected(
+    client, tmp_path, monkeypatch
+):
+    """Deleting one of 8 views via the real API endpoint is not flagged destructive."""
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+    client.patch("/api/settings", json={"views": _views(8)})
+
+    response = client.patch("/api/settings", json={"views": _views(8)[1:]})
+
+    assert response.status_code == 200
+    assert len(response.json()["views"]) == 7
+
+
+def test_patch_settings_backstop_response_includes_current_timestamp(
+    client, tmp_path, monkeypatch
+):
+    """A backstop 409's settings_updated_at reflects the server's actual (unwritten) value."""
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+    client.patch("/api/settings", json={"views": _views(8)})
+    real_ts = client.get("/api/settings").json()["settings_updated_at"]
+
+    response = client.patch("/api/settings", json={"views": [_views(8)[0]]})
+
+    assert response.status_code == 409
+    assert response.json()["settings_updated_at"] == real_ts
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/settings/sync -- destructive-write backstop + views_updated_at
+# ---------------------------------------------------------------------------
+
+
+def test_put_settings_sync_rejects_destructive_views_collapse(
+    client, tmp_path, monkeypatch
+):
+    """A sync payload with an 8->1 views collapse is rejected with 409/backstop, no write."""
+    import json
+
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "views": _views(8),
+                "settings_updated_at": 100.0,
+                "views_updated_at": 100.0,
+            }
+        )
+    )
+
+    response = client.put(
+        "/api/settings/sync",
+        json={
+            "settings": {"views": [_views(8)[0]]},
+            "settings_updated_at": 200.0,
+            "views_updated_at": 300.0,
+        },
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body["backstop"] is True
+    assert body["counts"]["before_views"] == 8
+    assert body["counts"]["after_views"] == 1
+
+    reloaded = settings_mod.load_settings()
+    assert len(reloaded["views"]) == 8
+    assert reloaded["settings_updated_at"] == 100.0, (
+        "no write must have happened at all"
+    )
+
+
+def test_put_settings_sync_legacy_peer_without_views_updated_at_interoperates(
+    client, tmp_path, monkeypatch
+):
+    """A sync payload omitting views_updated_at (legacy peer) still applies normally."""
+    import json
+
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    settings_path.write_text(json.dumps({"settings_updated_at": 100.0}))
+
+    response = client.put(
+        "/api/settings/sync",
+        json={
+            "settings": {"views": [{"name": "Work", "sessions": ["a"]}]},
+            "settings_updated_at": 200.0,
+            # views_updated_at omitted entirely -- legacy peer.
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["settings"]["views"] == [{"name": "Work", "sessions": ["a"]}]
+
+
+def test_get_settings_sync_includes_views_updated_at(client, tmp_path, monkeypatch):
+    """GET /api/settings/sync response includes views_updated_at as a top-level field."""
+    import muxplex.settings as settings_mod
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+    settings_mod.save_settings({"views": [{"name": "A", "sessions": []}]})
+
+    response = client.get("/api/settings/sync")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "views_updated_at" in body
+    assert "views_updated_at" not in body["settings"], (
+        "views_updated_at is metadata, must not appear inside the nested settings dict"
+    )
+
+
+# ---------------------------------------------------------------------------
 # fetch_remote: zero-session visibility and flapping grace period
 # ---------------------------------------------------------------------------
 
@@ -3653,6 +5411,153 @@ def test_federation_sessions_tags_local_with_device_id(client, monkeypatch, tmp_
     )
     assert local.get("sessionKey") == "local-uuid:dev", (
         f"Local session must have sessionKey='local-uuid:dev', got: {local.get('sessionKey')!r}"
+    )
+
+
+def test_federation_sessions_tags_local_with_device_version(
+    client, monkeypatch, tmp_path
+):
+    """GET /api/federation/sessions: local sessions carry deviceVersion == app.version.
+
+    This is what lets a client compare "this device" against federated peers
+    using a single response, without a second /api/instance-info fetch.
+    """
+    import json
+
+    import muxplex.main as main_mod
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    settings_path.write_text(
+        json.dumps({"device_name": "my-machine", "remote_instances": []})
+    )
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["dev"])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {"dev": ""})
+
+    response = client.get("/api/federation/sessions")
+    assert response.status_code == 200
+    data = response.json()
+
+    local_sessions = [s for s in data if s.get("remoteId") is None]
+    assert len(local_sessions) == 1
+    assert local_sessions[0].get("deviceVersion") == main_mod.app.version, (
+        f"Local session deviceVersion must equal app.version, got: {local_sessions[0].get('deviceVersion')!r}"
+    )
+
+
+def test_federation_sessions_remote_sessions_have_device_version(
+    client, monkeypatch, tmp_path
+):
+    """GET /api/federation/sessions: remote sessions carry deviceVersion from the
+    remote's own /api/instance-info, fetched alongside /api/sessions."""
+    import json
+    from unittest.mock import MagicMock
+
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "device_name": "local-host",
+                "remote_instances": [
+                    {"url": "http://spark-2:8088", "key": "abc123", "name": "spark-2"}
+                ],
+            }
+        )
+    )
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {})
+
+    async def mock_get(url, **kwargs):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = lambda: None
+        if url.endswith("/api/instance-info"):
+            mock_resp.json = lambda: {
+                "name": "spark-2",
+                "device_id": "spark-2-uuid",
+                "version": "0.16.0",
+                "federation_enabled": True,
+            }
+        else:
+            mock_resp.json = lambda: [{"name": "work", "snapshot": "", "bell": {}}]
+        return mock_resp
+
+    mock_client = MagicMock()
+    mock_client.get = mock_get
+    monkeypatch.setattr(client.app.state, "federation_client", mock_client)
+
+    response = client.get("/api/federation/sessions")
+    assert response.status_code == 200
+    data = response.json()
+
+    remote_sessions = [s for s in data if s.get("remoteId") is not None and "name" in s]
+    assert len(remote_sessions) == 1
+    assert remote_sessions[0].get("deviceVersion") == "0.16.0", (
+        f"Remote session deviceVersion must be '0.16.0', got: {remote_sessions[0].get('deviceVersion')!r}"
+    )
+
+
+def test_federation_sessions_device_version_unknown_when_remote_lacks_it(
+    client, monkeypatch, tmp_path
+):
+    """GET /api/federation/sessions: when the remote's /api/instance-info fails or
+    is too old to serve version, deviceVersion must be None -- never defaulted to
+    a real-looking version string that could be mistaken for agreement."""
+    import json
+    from unittest.mock import MagicMock
+
+    import httpx
+
+    import muxplex.settings as settings_mod
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    settings_path.write_text(
+        json.dumps(
+            {
+                "device_name": "local-host",
+                "remote_instances": [
+                    {
+                        "url": "http://spark-old:8088",
+                        "key": "abc123",
+                        "name": "spark-old",
+                    }
+                ],
+            }
+        )
+    )
+
+    monkeypatch.setattr("muxplex.main.get_session_list", lambda: [])
+    monkeypatch.setattr("muxplex.main.get_snapshots", lambda: {})
+
+    async def mock_get(url, **kwargs):
+        if url.endswith("/api/instance-info"):
+            raise httpx.ConnectError("connection refused")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = lambda: None
+        mock_resp.json = lambda: [{"name": "work", "snapshot": "", "bell": {}}]
+        return mock_resp
+
+    mock_client = MagicMock()
+    mock_client.get = mock_get
+    monkeypatch.setattr(client.app.state, "federation_client", mock_client)
+
+    response = client.get("/api/federation/sessions")
+    assert response.status_code == 200
+    data = response.json()
+
+    remote_sessions = [s for s in data if s.get("remoteId") is not None and "name" in s]
+    assert len(remote_sessions) == 1
+    assert remote_sessions[0].get("deviceVersion") is None, (
+        f"deviceVersion must be None when the remote's instance-info is unreachable, "
+        f"got: {remote_sessions[0].get('deviceVersion')!r}"
     )
 
 

@@ -9,9 +9,14 @@ import pytest
 
 import muxplex.sessions as sessions_mod
 from muxplex.sessions import (
+    DEFAULT_CAPTURE_LINES,
+    MAX_CAPTURE_LINES,
+    SESSION_HISTORY_LIMIT,
     capture_pane,
+    ensure_history_retention,
     enumerate_sessions,
     get_snapshots,
+    get_session_activity,
     get_session_list,
     list_windows,
     run_tmux,
@@ -198,6 +203,96 @@ async def test_enumerate_sessions_handles_tmux_error(mock_subprocess):
     assert result == []
 
 
+async def test_enumerate_sessions_requests_activity_field(mock_subprocess):
+    """enumerate_sessions() must ask tmux for #{window_activity} alongside
+    #{session_name} so activity data comes from the same subprocess call
+    (no second round trip).
+
+    Deliberately NOT #{session_activity}: verified empirically against a
+    real tmux server that session_activity only advances while a client is
+    attached, so it stays frozen forever for headless/unwatched sessions --
+    exactly the sessions this feature most needs to surface. window_activity
+    tracks real pane output unconditionally. See the sessions.py module
+    docstring for the full rationale.
+    """
+    with mock_subprocess("alpha\t1700000000\n") as mock_create:
+        await enumerate_sessions()
+
+    call_args = mock_create.call_args[0]
+    assert call_args[0] == "tmux"
+    assert call_args[1] == "list-sessions"
+    assert call_args[2] == "-F"
+    assert "#{session_name}" in call_args[3]
+    assert "#{window_activity}" in call_args[3]
+    assert "#{session_activity}" not in call_args[3]
+
+
+# ---------------------------------------------------------------------------
+# session-activity tests (sourced from tmux's #{window_activity})
+# ---------------------------------------------------------------------------
+
+
+async def test_enumerate_sessions_caches_activity(mock_subprocess):
+    """enumerate_sessions() parses the tab-separated activity field and
+    caches it, keyed by session name, exposed via get_session_activity()."""
+    with mock_subprocess("alpha\t1700000000\nbeta\t1700000050\n"):
+        names = await enumerate_sessions()
+
+    assert names == ["alpha", "beta"]
+    assert get_session_activity() == {"alpha": 1700000000.0, "beta": 1700000050.0}
+
+
+async def test_enumerate_sessions_activity_replaced_wholesale(mock_subprocess):
+    """A later enumerate_sessions() call fully replaces _activity -- a session
+    that has since closed must not linger in get_session_activity()."""
+    with mock_subprocess("alpha\t1700000000\nbeta\t1700000050\n"):
+        await enumerate_sessions()
+    assert "beta" in get_session_activity()
+
+    with mock_subprocess("alpha\t1700000100\n"):
+        await enumerate_sessions()
+
+    assert get_session_activity() == {"alpha": 1700000100.0}
+
+
+async def test_enumerate_sessions_missing_activity_field_is_tolerated(
+    mock_subprocess,
+):
+    """A line with no tab (older tmux output, or a mocked test) must not crash
+    -- the session name is still returned, just with no activity entry."""
+    with mock_subprocess("alpha\nbeta\n"):
+        names = await enumerate_sessions()
+
+    assert names == ["alpha", "beta"]
+    assert get_session_activity() == {}
+
+
+async def test_enumerate_sessions_malformed_activity_value_is_skipped_and_logged(
+    mock_subprocess, caplog
+):
+    """A non-numeric activity field is dropped (not crashed on) and logged --
+    the session name itself is still returned."""
+    with caplog.at_level("WARNING"):
+        with mock_subprocess("alpha\tnot-a-number\nbeta\t1700000050\n"):
+            names = await enumerate_sessions()
+
+    assert names == ["alpha", "beta"]
+    assert get_session_activity() == {"beta": 1700000050.0}
+    assert "alpha" in caplog.text
+
+
+def test_get_session_activity_returns_copy():
+    """get_session_activity() must return a copy -- mutating the result must
+    not corrupt the module's internal cache."""
+    sessions_mod._activity = {"alpha": 1700000000.0}
+
+    result = get_session_activity()
+    result["alpha"] = 0.0
+    result["injected"] = 999.0
+
+    assert get_session_activity() == {"alpha": 1700000000.0}
+
+
 # ---------------------------------------------------------------------------
 # capture_pane tests
 # ---------------------------------------------------------------------------
@@ -241,6 +336,66 @@ async def test_capture_pane_calls_correct_tmux_args(mock_subprocess):
     assert call_args[6] == "-S"
     assert call_args[7] == "-50"
     assert len(call_args) == 8, "-e must be present; no other extra args"
+
+
+async def test_capture_pane_default_lines_unchanged(mock_subprocess):
+    """capture_pane()'s default depth must still be exactly 30 -- no shape change
+    for any existing caller that doesn't pass `lines` explicitly."""
+    assert DEFAULT_CAPTURE_LINES == 30
+
+    with mock_subprocess("output\n") as mock_create:
+        await capture_pane("target-session")
+
+    call_args = mock_create.call_args[0]
+    assert call_args[7] == "-30"
+
+
+async def test_capture_pane_accepts_deep_line_request(mock_subprocess):
+    """capture_pane() must forward a caller-requested deep `lines` value untouched
+    (bounds enforcement lives at the API boundary, not here)."""
+    with mock_subprocess("output\n") as mock_create:
+        await capture_pane("target-session", lines=MAX_CAPTURE_LINES)
+
+    call_args = mock_create.call_args[0]
+    assert call_args[7] == f"-{MAX_CAPTURE_LINES}"
+
+
+# ---------------------------------------------------------------------------
+# ensure_history_retention tests
+# ---------------------------------------------------------------------------
+
+
+async def test_ensure_history_retention_calls_tmux_set_option(mock_subprocess):
+    """ensure_history_retention() must run `tmux set-option -t <name> history-limit <N>`."""
+    with mock_subprocess("") as mock_create:
+        await ensure_history_retention("target-session")
+
+    call_args = mock_create.call_args[0]
+    assert call_args[0] == "tmux"
+    assert call_args[1] == "set-option"
+    assert call_args[2] == "-t"
+    assert call_args[3] == "target-session"
+    assert call_args[4] == "history-limit"
+    assert call_args[5] == str(SESSION_HISTORY_LIMIT)
+
+
+async def test_ensure_history_retention_swallows_tmux_failure(mock_subprocess):
+    """A tmux failure (e.g. session vanished) must be logged and swallowed,
+    never raised -- this is a best-effort scrollback improvement, not a
+    correctness requirement, and must never fail session creation."""
+    with mock_subprocess(
+        stdout="", stderr="can't find session target-session", returncode=1
+    ):
+        # Must not raise.
+        await ensure_history_retention("target-session")
+
+
+def test_session_history_limit_exceeds_max_capture_lines():
+    """SESSION_HISTORY_LIMIT must stay comfortably above MAX_CAPTURE_LINES --
+    otherwise a caller's max-depth request could be silently truncated by
+    tmux's own retained scrollback, which would be a worse lie than the
+    original fixed 30-line ceiling this whole fix replaces."""
+    assert SESSION_HISTORY_LIMIT > MAX_CAPTURE_LINES
 
 
 # ---------------------------------------------------------------------------

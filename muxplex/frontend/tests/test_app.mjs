@@ -2080,9 +2080,13 @@ test('openSession mounts terminal AFTER connect POST, not inside animation timer
     new URL('../app.js', import.meta.url), 'utf8'
   );
 
-  // Find the openSession function body
+  // Find the openSession function body. Window is intentionally generous
+  // (not just enough for the CURRENT source) so a legitimate addition near
+  // the top of the function (e.g. a guard/comment block) doesn't push
+  // _openTerminal outside the window and produce a false failure here --
+  // that exact false failure is what widened this from 4000 to 5000.
   const fnStart = source.indexOf('async function openSession');
-  const fnBody = source.substring(fnStart, fnStart + 4000);
+  const fnBody = source.substring(fnStart, fnStart + 5000);
 
   // _openTerminal must NOT appear inside setTimeout
   const setTimeoutIdx = fnBody.indexOf('setTimeout');
@@ -2667,6 +2671,72 @@ test('buildTileHTML places device-badge inline in tile-header (before tile-meta)
   app._setServerSettings(null);
 });
 
+// --- device version surfacing (running/installed version QoL) ---
+
+test('formatDeviceVersion renders a known version with a leading v', () => {
+  assert.strictEqual(app.formatDeviceVersion('0.15.0'), 'v0.15.0');
+});
+
+test('formatDeviceVersion renders "version unknown" for null, undefined, and empty string', () => {
+  assert.strictEqual(app.formatDeviceVersion(null), 'version unknown');
+  assert.strictEqual(app.formatDeviceVersion(undefined), 'version unknown');
+  assert.strictEqual(app.formatDeviceVersion(''), 'version unknown');
+});
+
+test('formatDeviceVersion never renders "version unknown" as if it agreed with a real version', () => {
+  // An unknown remote must never be confused with "same version as me" -- the
+  // rendered string for unknown must not itself look like a version string.
+  const rendered = app.formatDeviceVersion(null);
+  assert.ok(!/^v[0-9]/.test(rendered), 'unknown-version rendering must not look like a real version');
+});
+
+test('buildTileHTML device-badge title attribute carries the known deviceVersion', () => {
+  app._setServerSettings({ multi_device_enabled: true });
+  const session = { name: 'work', deviceName: 'Laptop', deviceVersion: '0.15.0', sessionKey: '::work', snapshot: '' };
+  const html = app.buildTileHTML(session, 0, false);
+  assert.ok(html.includes('title="v0.15.0"'), 'device-badge title should show the known deviceVersion');
+  app._setServerSettings(null);
+});
+
+test('buildTileHTML device-badge title says "version unknown" when deviceVersion is missing', () => {
+  app._setServerSettings({ multi_device_enabled: true });
+  const session = { name: 'work', deviceName: 'Laptop', sessionKey: '::work', snapshot: '' };
+  const html = app.buildTileHTML(session, 0, false);
+  assert.ok(html.includes('title="version unknown"'), 'device-badge title should say version unknown, not a guessed value');
+  app._setServerSettings(null);
+});
+
+test('buildSidebarHTML device-badge title attribute carries the known deviceVersion', () => {
+  app._setServerSettings({ multi_device_enabled: true });
+  const session = { name: 'work', deviceName: 'Laptop', deviceVersion: '0.16.1', sessionKey: '::work', snapshot: '', bell: { unseen_count: 0 } };
+  const html = app.buildSidebarHTML(session, null);
+  assert.ok(html.includes('title="v0.16.1"'), 'device-badge title should show the known deviceVersion');
+  app._setServerSettings(null);
+});
+
+test('buildSidebarHTML device-badge title says "version unknown" when deviceVersion is missing', () => {
+  app._setServerSettings({ multi_device_enabled: true });
+  const session = { name: 'work', deviceName: 'Laptop', sessionKey: '::work', snapshot: '', bell: { unseen_count: 0 } };
+  const html = app.buildSidebarHTML(session, null);
+  assert.ok(html.includes('title="version unknown"'), 'device-badge title should say version unknown, not a guessed value');
+  app._setServerSettings(null);
+});
+
+test('buildStatusTileHTML shows the known deviceVersion for an unreachable remote', () => {
+  const html = app.buildStatusTileHTML('spark-2', 'Offline', 'offline', '0.15.0');
+  assert.ok(html.includes('v0.15.0'), 'status tile should show the known deviceVersion');
+});
+
+test('buildStatusTileHTML shows "version unknown" when deviceVersion is null', () => {
+  const html = app.buildStatusTileHTML('spark-2', 'Offline', 'offline', null);
+  assert.ok(html.includes('version unknown'), 'status tile must render unknown distinctly, never a guessed value');
+});
+
+test('buildStatusTileHTML omits deviceVersion argument still renders "version unknown" (backward compatible call)', () => {
+  const html = app.buildStatusTileHTML('spark-2', 'Auth required', 'auth');
+  assert.ok(html.includes('version unknown'), 'a caller that omits deviceVersion must still get an honest unknown, not a crash or blank');
+});
+
 test('buildTileHTML badge and options-btn are siblings in tile-header when badge present', () => {
   // Since the badge moved out of tile-meta into tile-header directly, tile-meta-sep is removed.
   // The tile-options-btn is also now inside tile-header as a flex sibling.
@@ -2734,6 +2804,112 @@ test('renderGrid in grouped mode produces device-group-header elements', () => {
 test('_setGridViewMode and renderGroupedGrid are exported', () => {
   assert.strictEqual(typeof app._setGridViewMode, 'function', '_setGridViewMode should be exported');
   assert.strictEqual(typeof app.renderGroupedGrid, 'function', 'renderGroupedGrid should be exported');
+});
+
+// --- renderGrid 'recent' sort (session-activity feature) ---
+
+function renderGridToHTML(sessions) {
+  const collectedHTML = [];
+  const mockGrid = {
+    get innerHTML() { return collectedHTML[0] || ''; },
+    set innerHTML(v) { collectedHTML[0] = v; },
+  };
+  const mockEmpty = { style: {}, classList: { add: () => {}, remove: () => {} } };
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => {
+    if (id === 'session-grid') return mockGrid;
+    if (id === 'empty-state') return mockEmpty;
+    return null;
+  };
+
+  app.renderGrid(sessions);
+
+  globalThis.document.getElementById = origGetById;
+  return mockGrid.innerHTML;
+}
+
+test("renderGrid sort_order 'recent' orders sessions by last_activity_at descending", () => {
+  app._setServerSettings({ sort_order: 'recent' });
+  const sessions = [
+    { name: 'oldest', last_activity_at: 100 },
+    { name: 'newest', last_activity_at: 300 },
+    { name: 'middle', last_activity_at: 200 },
+  ];
+
+  const html = renderGridToHTML(sessions);
+  const iNewest = html.indexOf('data-session="newest"');
+  const iMiddle = html.indexOf('data-session="middle"');
+  const iOldest = html.indexOf('data-session="oldest"');
+  assert.ok(iNewest > -1 && iMiddle > -1 && iOldest > -1, 'all three tiles should render');
+  assert.ok(iNewest < iMiddle, 'most recently active session must come first');
+  assert.ok(iMiddle < iOldest, 'middle activity must come before oldest');
+
+  app._setServerSettings(null);
+});
+
+test("renderGrid sort_order 'recent' sorts sessions with no last_activity_at last", () => {
+  app._setServerSettings({ sort_order: 'recent' });
+  const sessions = [
+    { name: 'unknown-activity' },
+    { name: 'has-activity', last_activity_at: 500 },
+  ];
+
+  const html = renderGridToHTML(sessions);
+  const iKnown = html.indexOf('data-session="has-activity"');
+  const iUnknown = html.indexOf('data-session="unknown-activity"');
+  assert.ok(iKnown > -1 && iUnknown > -1, 'both tiles should render');
+  assert.ok(iKnown < iUnknown, 'session with a known activity timestamp must sort before one without');
+
+  app._setServerSettings(null);
+});
+
+test("renderGrid sort_order 'recent' is stable for ties (preserves server-provided order)", () => {
+  app._setServerSettings({ sort_order: 'recent' });
+  const sessions = [
+    { name: 'first-no-activity' },
+    { name: 'second-no-activity' },
+    { name: 'third-tied', last_activity_at: 100 },
+    { name: 'fourth-tied', last_activity_at: 100 },
+  ];
+
+  const html = renderGridToHTML(sessions);
+  // Ties among timestamped sessions preserve original relative order.
+  const iThird = html.indexOf('data-session="third-tied"');
+  const iFourth = html.indexOf('data-session="fourth-tied"');
+  assert.ok(iThird < iFourth, 'equal-timestamp sessions must preserve original order');
+  // Ties among null-timestamp sessions (both sorted last) also preserve original order.
+  const iFirst = html.indexOf('data-session="first-no-activity"');
+  const iSecond = html.indexOf('data-session="second-no-activity"');
+  assert.ok(iFirst < iSecond, 'null-timestamp sessions must preserve original order among themselves');
+
+  app._setServerSettings(null);
+});
+
+test("renderGrid sort_order 'recent' on mobile still uses sortByPriority (untouched)", () => {
+  const origInnerWidth = globalThis.window.innerWidth;
+  globalThis.window.innerWidth = 480; // below MOBILE_THRESHOLD (600)
+
+  app._setServerSettings({ sort_order: 'recent' });
+  const sessions = [
+    { name: 'idle-recent', last_activity_at: 999, bell: { unseen_count: 0 } },
+    {
+      name: 'needs-attention',
+      last_activity_at: 1,
+      bell: { unseen_count: 1, last_fired_at: 2, seen_at: null },
+    },
+  ];
+
+  const html = renderGridToHTML(sessions);
+  const iBell = html.indexOf('data-session="needs-attention"');
+  const iIdle = html.indexOf('data-session="idle-recent"');
+  assert.ok(iBell > -1 && iIdle > -1, 'both tiles should render');
+  assert.ok(
+    iBell < iIdle,
+    'mobile priority sort (bell first) must still apply, ignoring last_activity_at ordering'
+  );
+
+  globalThis.window.innerWidth = origInnerWidth;
+  app._setServerSettings(null);
 });
 
 // --- renderFilterBar (task-12) ---
@@ -2963,11 +3139,17 @@ test('buildStatusTileHTML renders statusText in badge span', () => {
 
 // --- Issue 1: Loading placeholder tile ---
 
+// Window generous enough to cover the whole createNewSession body -- the
+// auto-add-to-view block (patchSettingsGuarded-based, since v0.11 CAS work)
+// pushed the loading-tile logic further from the function start than a
+// tighter window would capture.
+const CREATE_NEW_SESSION_WINDOW = 4500;
+
 test('createNewSession injects tile--loading placeholder after POST succeeds', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const start = source.indexOf('async function createNewSession(');
   assert.ok(start !== -1, 'createNewSession must exist');
-  const snippet = source.slice(start, start + 2500);
+  const snippet = source.slice(start, start + CREATE_NEW_SESSION_WINDOW);
   assert.ok(snippet.includes('tile--loading'), 'createNewSession must inject tile--loading placeholder class');
   assert.ok(snippet.includes('loading-tile-'), 'createNewSession must use loading-tile- id prefix for the placeholder');
 });
@@ -2975,7 +3157,7 @@ test('createNewSession injects tile--loading placeholder after POST succeeds', (
 test('createNewSession removes loading placeholder when session is found', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const start = source.indexOf('async function createNewSession(');
-  const snippet = source.slice(start, start + 2500);
+  const snippet = source.slice(start, start + CREATE_NEW_SESSION_WINDOW);
   assert.ok(
     snippet.includes('loadingTile') && snippet.includes('.remove()'),
     'createNewSession must remove the loading tile (loadingTile.remove()) when session is found'
@@ -4047,7 +4229,10 @@ test('buildSidebarHTML shows content from top of 40-row terminal (trim BEFORE sl
 test('buildTileHTML trim happens BEFORE slice in source (structural order check)', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const fnStart = source.indexOf('function buildTileHTML');
-  const fnBody = source.substring(fnStart, fnStart + 2000);
+  // Window sized generously past the device-badge title-attribute line (which
+  // legitimately grew the head of this function) so this keeps checking the
+  // real trim/slice ordering rather than an arbitrary byte offset.
+  const fnBody = source.substring(fnStart, fnStart + 2500);
   const trimIdx = fnBody.indexOf('.pop()');
   const sliceIdx = fnBody.indexOf('.slice(');
   assert.ok(
@@ -4270,8 +4455,12 @@ test('updatePageTitle function exists and uses activity count', () => {
 
 test('updatePageTitle is called from pollSessions', () => {
   const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
-  // Use 700 chars — the call is ~562 chars into the function after comments/whitespace
-  const pollFn = source.substring(source.indexOf('async function pollSessions'), source.indexOf('async function pollSessions') + 700);
+  // Scan to pollSessions' own closing brace (same pattern as the updateFaviconBadge
+  // test) — robust to the function growing, unlike a fixed char window.
+  const pollStart = source.indexOf('async function pollSessions()');
+  assert.ok(pollStart !== -1, 'pollSessions must exist');
+  const pollEnd = source.indexOf('\n}', pollStart);
+  const pollFn = source.substring(pollStart, pollEnd + 2);
   assert.ok(pollFn.includes('updatePageTitle'), 'pollSessions must call updatePageTitle');
 });
 
@@ -4344,6 +4533,8 @@ test('showNewSessionInput creates device select when multi_device_enabled with r
       value: '',
       style: {},
       options: [],
+      attrs: {},
+      setAttribute(name, value) { this.attrs[name] = value; },
       appendChild: () => {},
       addEventListener: () => {},
       focus: () => {},
@@ -4361,6 +4552,188 @@ test('showNewSessionInput creates device select when multi_device_enabled with r
   globalThis.document.createElement = origCE;
 
   assert.ok(createdTags.includes('select'), 'showNewSessionInput must create a <select> element when multi_device_enabled');
+});
+
+test('_suppressAutofill sets every AUTOFILL_SUPPRESSION_ATTRS key and disables spellcheck', () => {
+  const attrs = {};
+  const stubInput = {
+    spellcheck: true,
+    setAttribute(name, value) { attrs[name] = value; },
+  };
+
+  const returned = app._suppressAutofill(stubInput);
+
+  for (const [key, value] of Object.entries(app.AUTOFILL_SUPPRESSION_ATTRS)) {
+    assert.strictEqual(attrs[key], value, `_suppressAutofill must set ${key}="${value}"`);
+  }
+  assert.strictEqual(stubInput.spellcheck, false, '_suppressAutofill must disable spellcheck');
+  assert.strictEqual(returned, stubInput, '_suppressAutofill must return the same input (for chaining)');
+});
+
+test('new session input suppresses browser and password-manager autofill', () => {
+  // No remotes -> no <select>, so the only element created is the name input.
+  app._setServerSettings({ multi_device_enabled: false, remote_instances: [] });
+
+  const origCE = globalThis.document.createElement;
+  let inputEl = null;
+
+  globalThis.document.createElement = (tag) => {
+    const el = {
+      tagName: tag.toUpperCase(),
+      className: '',
+      type: '',
+      placeholder: '',
+      spellcheck: true,
+      value: '',
+      style: {},
+      attrs: {},
+      setAttribute(name, value) { this.attrs[name] = value; },
+      appendChild: () => {},
+      addEventListener: () => {},
+      focus: () => {},
+    };
+    if (tag === 'input') inputEl = el;
+    return el;
+  };
+
+  const btn = { style: {}, parentNode: { insertBefore: () => {} } };
+  app.showNewSessionInput(btn);
+  globalThis.document.createElement = origCE;
+
+  assert.ok(inputEl !== null, 'showNewSessionInput must create an <input>');
+
+  // Assert through the shared AUTOFILL_SUPPRESSION_ATTRS contract rather than
+  // duplicating the literal attribute list here -- that constant is the single
+  // source of truth, and _suppressAutofill's own test above covers the mechanism.
+  for (const [key, value] of Object.entries(app.AUTOFILL_SUPPRESSION_ATTRS)) {
+    assert.strictEqual(inputEl.attrs[key], value, `${key} must be set to "${value}"`);
+  }
+  assert.strictEqual(inputEl.spellcheck, false, 'spellcheck must be disabled');
+});
+
+// --- _suppressAutofill applied to the other five JS-created inputs ---
+//
+// Source-text assertions are used here (rather than exercising each DOM path,
+// several of which are deeply nested in dropdown/panel UI) to confirm each
+// function calls _suppressAutofill on the right variable.
+
+test('showNewViewInput (header "+ New View" dropdown) applies _suppressAutofill', () => {
+  const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  const fnStart = source.indexOf('function showNewViewInput(');
+  assert.ok(fnStart !== -1, 'showNewViewInput function must exist');
+  const fnEnd = source.indexOf('\nfunction ', fnStart + 1);
+  const fnBody = source.substring(fnStart, fnEnd !== -1 ? fnEnd : fnStart + 2000);
+  assert.match(fnBody, /_suppressAutofill\(input\)/, 'showNewViewInput must call _suppressAutofill(input)');
+});
+
+test('showSidebarNewViewInput (sidebar "+ New View" dropdown) applies _suppressAutofill', () => {
+  const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  const fnStart = source.indexOf('function showSidebarNewViewInput(');
+  assert.ok(fnStart !== -1, 'showSidebarNewViewInput function must exist');
+  const fnEnd = source.indexOf('\nfunction ', fnStart + 1);
+  const fnBody = source.substring(fnStart, fnEnd !== -1 ? fnEnd : fnStart + 2000);
+  assert.match(fnBody, /_suppressAutofill\(input\)/, 'showSidebarNewViewInput must call _suppressAutofill(input)');
+});
+
+test('openManageViewPanel inline view-rename input applies _suppressAutofill', () => {
+  const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  const fnStart = source.indexOf('function openManageViewPanel(');
+  assert.ok(fnStart !== -1, 'openManageViewPanel function must exist');
+  const fnEnd = source.indexOf('\nfunction ', fnStart + 1);
+  const fnBody = source.substring(fnStart, fnEnd !== -1 ? fnEnd : fnStart + 4000);
+  assert.match(
+    fnBody,
+    /manage-view-panel__name-input[\s\S]*?_suppressAutofill\(input\)/,
+    'the rename input inside openManageViewPanel must call _suppressAutofill(input)',
+  );
+});
+
+test('_buildRemoteInstanceRow applies _suppressAutofill to urlInput and nameInput', () => {
+  const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  const fnStart = source.indexOf('function _buildRemoteInstanceRow(');
+  assert.ok(fnStart !== -1, '_buildRemoteInstanceRow function must exist');
+  const fnEnd = source.indexOf('\nfunction ', fnStart + 1);
+  const fnBody = source.substring(fnStart, fnEnd !== -1 ? fnEnd : fnStart + 2000);
+  assert.match(fnBody, /_suppressAutofill\(urlInput\)/, '_buildRemoteInstanceRow must call _suppressAutofill(urlInput)');
+  assert.match(fnBody, /_suppressAutofill\(nameInput\)/, '_buildRemoteInstanceRow must call _suppressAutofill(nameInput)');
+});
+
+// --- Deliberate exclusion: federation key input must NOT be suppressed ---
+//
+// keyInput is a genuine secret (type="password") a user may deliberately want
+// their password manager to remember. If a future refactor "helpfully" sweeps
+// _suppressAutofill across every input in this function, this test must fail.
+
+test('_buildRemoteInstanceRow does NOT apply _suppressAutofill to keyInput (deliberate exclusion)', () => {
+  const source = fs.readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  const fnStart = source.indexOf('function _buildRemoteInstanceRow(');
+  assert.ok(fnStart !== -1, '_buildRemoteInstanceRow function must exist');
+  const fnEnd = source.indexOf('\nfunction ', fnStart + 1);
+  const fnBody = source.substring(fnStart, fnEnd !== -1 ? fnEnd : fnStart + 2000);
+  assert.doesNotMatch(
+    fnBody,
+    /_suppressAutofill\(keyInput\)/,
+    'keyInput is a real secret field (type="password") -- it must NOT be autofill-suppressed',
+  );
+});
+
+// --- Sync test: index.html static inputs must mirror AUTOFILL_SUPPRESSION_ATTRS ---
+//
+// Chrome scans the DOM for autofill targets at parse time, before our JS runs,
+// so these two inputs carry the suppression attributes as literal markup
+// instead of getting them from _suppressAutofill. This test derives the
+// expected attribute list from the constant (not a hardcoded copy) so it FAILS
+// if someone adds a key to AUTOFILL_SUPPRESSION_ATTRS without updating the
+// markup in index.html.
+
+function _extractInputTag(html, id) {
+  const idIdx = html.indexOf(`id="${id}"`);
+  assert.ok(idIdx !== -1, `index.html must contain an input with id="${id}"`);
+  const tagStart = html.lastIndexOf('<input', idIdx);
+  const tagEnd = html.indexOf('/>', idIdx);
+  assert.ok(tagStart !== -1 && tagEnd !== -1, `could not locate full <input> tag for id="${id}"`);
+  return html.substring(tagStart, tagEnd);
+}
+
+test('index.html #terminal-search-input mirrors AUTOFILL_SUPPRESSION_ATTRS', () => {
+  const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const tag = _extractInputTag(html, 'terminal-search-input');
+
+  for (const [key, value] of Object.entries(app.AUTOFILL_SUPPRESSION_ATTRS)) {
+    assert.ok(tag.includes(`${key}="${value}"`), `#terminal-search-input must carry ${key}="${value}"`);
+  }
+  assert.ok(tag.includes('spellcheck="false"'), '#terminal-search-input must carry spellcheck="false"');
+});
+
+test('index.html #setting-device-name mirrors AUTOFILL_SUPPRESSION_ATTRS', () => {
+  const html = fs.readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const tag = _extractInputTag(html, 'setting-device-name');
+
+  for (const [key, value] of Object.entries(app.AUTOFILL_SUPPRESSION_ATTRS)) {
+    assert.ok(tag.includes(`${key}="${value}"`), `#setting-device-name must carry ${key}="${value}"`);
+  }
+  assert.ok(tag.includes('spellcheck="false"'), '#setting-device-name must carry spellcheck="false"');
+});
+
+// --- Deliberate exclusion: login.html must NEVER get autofill suppression ---
+//
+// login.html is the ONE form where password managers are wanted. Applying any
+// suppression attribute here would be a real bug, not a fix. This guards
+// against a future "apply it everywhere" sweep breaking login.
+
+test('login.html inputs are NOT autofill-suppressed (deliberate exclusion)', () => {
+  const html = fs.readFileSync(new URL('../login.html', import.meta.url), 'utf8');
+  const usernameTag = _extractInputTag(html, 'username');
+  const passwordTag = _extractInputTag(html, 'password');
+
+  const suppressionOnlyKeys = ['data-1p-ignore', 'data-lpignore', 'data-bwignore', 'data-form-type'];
+  for (const key of suppressionOnlyKeys) {
+    assert.ok(!usernameTag.includes(key), `login.html #username must NOT carry ${key}`);
+    assert.ok(!passwordTag.includes(key), `login.html #password must NOT carry ${key}`);
+  }
+
+  assert.ok(usernameTag.includes('autocomplete="username"'), '#username must keep autocomplete="username"');
+  assert.ok(passwordTag.includes('autocomplete="current-password"'), '#password must keep autocomplete="current-password"');
 });
 
 test('showNewSessionInput passes remoteId from device select to createNewSession', () => {
@@ -6165,4 +6538,808 @@ test('shouldRestoreSession keeps full restore behavior at / (no regression)', ()
   assert.strictEqual(app.shouldRestoreSession('root', null), true);
   assert.strictEqual(app.shouldRestoreSession(null, null), false);
   assert.strictEqual(app.shouldRestoreSession(null, 'sidekick'), false);
+});
+
+// --- followRemoteActiveSession (PWA follows external session switch) ---
+// active_session is server-global; when another device (Stream Deck, agent)
+// switches it via POST /connect, the poll loop must detect the change and
+// re-open the new session through the same path restoreState() uses.
+
+test('pollActiveState fetches ONLY /api/state and wires followRemoteActiveSession', () => {
+  const src = app.pollActiveState.toString();
+  assert.ok(src.includes("'/api/state'"), 'pollActiveState must fetch /api/state');
+  assert.ok(src.includes('followRemoteActiveSession'), 'pollActiveState must call followRemoteActiveSession');
+  assert.ok(!src.includes('federation'), 'pollActiveState must never touch federation endpoints');
+});
+
+test('pollSessions no longer drives session-follow (superseded by dedicated state poll)', () => {
+  const src = app.pollSessions.toString();
+  assert.ok(
+    !src.includes('followRemoteActiveSession('),
+    'pollSessions must not call followRemoteActiveSession — the slow federation fetch would make the follow snapshot seconds stale',
+  );
+});
+
+test('startStatePolling self-schedules independently of startPolling', () => {
+  const src = app.startStatePolling.toString();
+  assert.ok(src.includes('pollActiveState'), 'startStatePolling must drive pollActiveState');
+  assert.ok(src.includes('setTimeout'), 'startStatePolling must self-schedule via setTimeout (no overlap)');
+  assert.ok(src.includes('STATE_POLL_MS'), 'startStatePolling must use its own dedicated interval');
+});
+
+test('followRemoteActiveSession uses restoreState opts shape (skipAnimation + remoteId)', () => {
+  const src = app.followRemoteActiveSession.toString();
+  assert.ok(src.includes('skipAnimation: true'), 'must pass skipAnimation: true like restoreState');
+  assert.ok(src.includes('remoteId'), 'must pass remoteId like restoreState');
+});
+
+test('dedicated state poll detects remote active_session change and switches via openSession path', async () => {
+  const calls = [];
+  const mockEl = { textContent: '', className: '' };
+  const origGetById = globalThis.document.getElementById;
+  const origQSA = globalThis.document.querySelectorAll;
+  const origOpenTerminal = globalThis.window._openTerminal;
+  let openTerminalName = null;
+  globalThis.document.getElementById = (id) => (id === 'connection-status' ? mockEl : null);
+  globalThis.document.querySelectorAll = () => [];
+  globalThis.window._openTerminal = (name) => { openTerminalName = name; };
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    if (method === 'GET' && url === '/api/state') {
+      return { ok: true, json: async () => ({ active_session: 'beta', active_remote_id: null }) };
+    }
+    return { ok: true, json: async () => [] };
+  };
+
+  // Session already open in fullscreen (option a precondition)
+  app._setViewMode('fullscreen');
+  app._setViewingSession('alpha');
+  app._setViewingRemoteId('');
+
+  await app.pollActiveState();
+  // openSession is fired without awaiting inside the poll loop — flush it
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.ok(
+    calls.includes('POST /api/sessions/beta/connect'),
+    'remote switch must trigger the existing openSession /connect path; calls: ' + JSON.stringify(calls),
+  );
+  assert.strictEqual(openTerminalName, 'beta', 'terminal must be re-attached to the new session');
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelectorAll = origQSA;
+  globalThis.window._openTerminal = origOpenTerminal;
+  globalThis.fetch = undefined;
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  app._setViewingRemoteId('');
+});
+
+test('self-initiated switch does not double-switch (state matches viewing session)', async () => {
+  const calls = [];
+  const mockEl = { textContent: '', className: '' };
+  const origGetById = globalThis.document.getElementById;
+  const origQSA = globalThis.document.querySelectorAll;
+  globalThis.document.getElementById = (id) => (id === 'connection-status' ? mockEl : null);
+  globalThis.document.querySelectorAll = () => [];
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    if (method === 'GET' && url === '/api/state') {
+      return { ok: true, json: async () => ({ active_session: 'beta', active_remote_id: null }) };
+    }
+    return { ok: true, json: async () => [] };
+  };
+
+  // openSession() already set these synchronously before its PATCH landed
+  app._setViewMode('fullscreen');
+  app._setViewingSession('beta');
+  app._setViewingRemoteId('');
+
+  await app.pollActiveState();
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.ok(
+    !calls.some((c) => c.startsWith('POST ')),
+    'no POST may fire when active_session already matches the viewed session; calls: ' + JSON.stringify(calls),
+  );
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelectorAll = origQSA;
+  globalThis.fetch = undefined;
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  app._setViewingRemoteId('');
+});
+
+// --- Regression: local switch must not be reverted by a stale poll ---
+// A local sidebar/grid click sets _viewingSession synchronously, but the
+// server's active_session doesn't catch up until the /connect POST resolves
+// and the fire-and-forget PATCH /api/state settles. A poll landing inside
+// that window used to see the OLD active_session, conclude a REMOTE device
+// had switched away, and snap the user back to the session they just left.
+
+test('local switch pends the guard: a stale poll before the PATCH settles does not snap back', async () => {
+  const calls = [];
+  const mockEl = { textContent: '', className: '' };
+  const origGetById = globalThis.document.getElementById;
+  const origQSA = globalThis.document.querySelectorAll;
+  const origOpenTerminal = globalThis.window._openTerminal;
+  globalThis.document.getElementById = (id) => (id === 'connection-status' ? mockEl : null);
+  globalThis.document.querySelectorAll = () => [];
+  globalThis.window._openTerminal = () => {};
+  // The connect POST resolves immediately, but the PATCH /api/state never
+  // settles during this test (a never-resolving promise) -- this pins the
+  // pending-local-switch window open so the assertion below is deterministic
+  // regardless of real microtask timing.
+  globalThis.fetch = (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    if (method === 'PATCH' && url === '/api/state') {
+      return new Promise(function () {}); // never settles
+    }
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+
+  app._setViewMode('fullscreen');
+  app._setViewingSession('alpha');
+  app._setViewingRemoteId('');
+
+  // Local switch: user clicks 'beta'. This is the real openSession() path —
+  // it increments _pendingLocalSwitches synchronously and only decrements it
+  // once the PATCH above settles (which, in this test, it never does).
+  await app.openSession('beta', { skipAnimation: true });
+
+  // Simulate the exact stale read: a poll landing right now still sees the
+  // server's OLD active_session ('alpha') because our own PATCH is still
+  // in flight.
+  calls.length = 0;
+  app.followRemoteActiveSession({ active_session: 'alpha', active_remote_id: null });
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.ok(
+    !calls.some((c) => c.startsWith('POST ')),
+    'a stale poll while our own switch is still pending must not revert it; calls: ' + JSON.stringify(calls),
+  );
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelectorAll = origQSA;
+  globalThis.window._openTerminal = origOpenTerminal;
+  globalThis.fetch = undefined;
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  app._setViewingRemoteId('');
+  app._setPendingLocalSwitches(0);
+});
+
+test('no pending local switch: a genuinely stale remote switch is still followed', async () => {
+  const calls = [];
+  const mockEl = { textContent: '', className: '' };
+  const origGetById = globalThis.document.getElementById;
+  const origQSA = globalThis.document.querySelectorAll;
+  const origOpenTerminal = globalThis.window._openTerminal;
+  globalThis.document.getElementById = (id) => (id === 'connection-status' ? mockEl : null);
+  globalThis.document.querySelectorAll = () => [];
+  globalThis.window._openTerminal = () => {};
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    return { ok: true, json: async () => ({}) };
+  };
+
+  app._setViewMode('fullscreen');
+  app._setViewingSession('alpha');
+  app._setViewingRemoteId('');
+  // No local switch in flight -- a genuine remote switch must still be followed.
+  app._setPendingLocalSwitches(0);
+
+  app.followRemoteActiveSession({ active_session: 'gamma', active_remote_id: null });
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.ok(
+    calls.includes('POST /api/sessions/gamma/connect'),
+    'with no pending local switch, a genuine remote switch must not be suppressed; calls: ' + JSON.stringify(calls),
+  );
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelectorAll = origQSA;
+  globalThis.window._openTerminal = origOpenTerminal;
+  globalThis.fetch = undefined;
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  app._setViewingRemoteId('');
+  app._setPendingLocalSwitches(0);
+});
+
+test('remote switch is NOT followed from the grid (no session open — option a)', async () => {
+  const calls = [];
+  const mockEl = { textContent: '', className: '' };
+  const origGetById = globalThis.document.getElementById;
+  const origQSA = globalThis.document.querySelectorAll;
+  globalThis.document.getElementById = (id) => (id === 'connection-status' ? mockEl : null);
+  globalThis.document.querySelectorAll = () => [];
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    if (method === 'GET' && url === '/api/state') {
+      return { ok: true, json: async () => ({ active_session: 'beta', active_remote_id: null }) };
+    }
+    return { ok: true, json: async () => [] };
+  };
+
+  // Grid/overview: no session open
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  app._setViewingRemoteId('');
+
+  await app.pollActiveState();
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.ok(
+    !calls.some((c) => c.startsWith('POST ')),
+    'must not force-open a session from the grid on a remote switch; calls: ' + JSON.stringify(calls),
+  );
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelectorAll = origQSA;
+  globalThis.fetch = undefined;
+  app._setViewingSession(null);
+});
+
+test('same session name on a different remote device is followed (remote_id differs)', async () => {
+  const calls = [];
+  const origQSA = globalThis.document.querySelectorAll;
+  const origOpenTerminal = globalThis.window._openTerminal;
+  globalThis.document.querySelectorAll = () => [];
+  globalThis.window._openTerminal = () => {};
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    return { ok: true, json: async () => ({}) };
+  };
+
+  app._setViewMode('fullscreen');
+  app._setViewingSession('beta');
+  app._setViewingRemoteId('');
+
+  app.followRemoteActiveSession({ active_session: 'beta', active_remote_id: 'dev1' });
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.ok(
+    calls.includes('POST /api/federation/dev1/connect/beta'),
+    'differing remote_id must route through the federation connect path; calls: ' + JSON.stringify(calls),
+  );
+
+  globalThis.document.querySelectorAll = origQSA;
+  globalThis.window._openTerminal = origOpenTerminal;
+  globalThis.fetch = undefined;
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  app._setViewingRemoteId('');
+});
+
+test('followRemoteActiveSession no-ops on null state or null active_session', () => {
+  // Would throw on fetch if it tried to openSession — fetch is undefined here
+  app._setViewMode('fullscreen');
+  app._setViewingSession('alpha');
+  app.followRemoteActiveSession(null);
+  app.followRemoteActiveSession({ active_session: null, active_remote_id: null });
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+});
+
+test('dedicated state poll follows on a FRESH snapshot while the federation fetch is still pending', async () => {
+  // Regression guard for the 8-10s deck->PWA latency: with 2 federation
+  // remotes hard-down, /api/federation/sessions blocks for the full
+  // per-remote timeout. The follow must NOT wait on it.
+  const calls = [];
+  const mockEl = { textContent: '', className: '' };
+  const origGetById = globalThis.document.getElementById;
+  const origQSA = globalThis.document.querySelectorAll;
+  const origOpenTerminal = globalThis.window._openTerminal;
+  globalThis.document.getElementById = (id) => (id === 'connection-status' ? mockEl : null);
+  globalThis.document.querySelectorAll = () => [];
+  globalThis.window._openTerminal = () => {};
+
+  let releaseFederation;
+  const federationGate = new Promise((r) => { releaseFederation = r; });
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    if (method === 'GET' && url === '/api/federation/sessions') {
+      await federationGate; // simulate down remotes: blocks until released
+      return { ok: true, json: async () => [] };
+    }
+    if (method === 'GET' && url === '/api/state') {
+      return { ok: true, json: async () => ({ active_session: 'beta', active_remote_id: null }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+
+  app._setServerSettings({ multi_device_enabled: true });
+  app._setViewMode('fullscreen');
+  app._setViewingSession('alpha');
+  app._setViewingRemoteId('');
+
+  const sessionsPoll = app.pollSessions(); // kicks off the blocked federation fetch
+  await app.pollActiveState();             // dedicated poll must complete regardless
+  await new Promise((r) => setTimeout(r, 25)); // flush fire-and-forget openSession
+
+  assert.ok(
+    calls.includes('POST /api/sessions/beta/connect'),
+    'follow-connect must fire while /api/federation/sessions is still pending; calls: ' + JSON.stringify(calls),
+  );
+
+  releaseFederation();
+  await sessionsPoll; // clean up: let the blocked poll finish
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.document.querySelectorAll = origQSA;
+  globalThis.window._openTerminal = origOpenTerminal;
+  globalThis.fetch = undefined;
+  app._setServerSettings(null);
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+  app._setViewingRemoteId('');
+});
+
+// --- followRemoteActiveView (PWA follows external view switch) ---
+// active_view is server-global (last writer wins); when another device
+// (Stream Deck, agent, another browser) switches it via PATCH /api/state,
+// the dedicated state poll must detect the change and apply it locally.
+// CONTRACT: the remote-apply path must NOT re-PATCH the server — it is
+// echoing a value just received FROM the server (re-PATCHing is redundant
+// and a feedback-loop hazard). Only user-initiated switchView() PATCHes.
+
+test('pollActiveState hands the same fresh snapshot to followRemoteActiveView', () => {
+  const src = app.pollActiveState.toString();
+  assert.ok(src.includes('followRemoteActiveView'), 'pollActiveState must call followRemoteActiveView');
+  assert.ok(src.includes('followRemoteActiveSession'), 'session-follow must remain wired alongside view-follow');
+});
+
+test('followRemoteActiveView and applyViewLocally never PATCH (no re-PATCH contract)', () => {
+  assert.ok(
+    !app.followRemoteActiveView.toString().includes('PATCH'),
+    'followRemoteActiveView must not PATCH — it applies server state, it does not set it',
+  );
+  assert.ok(
+    !app.applyViewLocally.toString().includes('PATCH'),
+    'applyViewLocally must be purely local — the PATCH belongs to switchView only',
+  );
+});
+
+test('dedicated state poll applies a remote active_view change locally without re-PATCHing', async () => {
+  const calls = [];
+  const idsRequested = [];
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => { idsRequested.push(id); return null; };
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    if (method === 'GET' && url === '/api/state') {
+      return { ok: true, json: async () => ({ active_session: null, active_remote_id: null, active_view: 'focus' }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+
+  app._setActiveView('all');
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+
+  await app.pollActiveState();
+  await new Promise((r) => setTimeout(r, 25)); // flush any stray fire-and-forget
+
+  assert.strictEqual(app._getActiveView(), 'focus', 'local view must follow the server-global active_view');
+  assert.ok(
+    !calls.some((c) => c.startsWith('PATCH ')),
+    'remote-apply must NOT re-PATCH /api/state; calls: ' + JSON.stringify(calls),
+  );
+  assert.ok(
+    idsRequested.includes('view-dropdown-menu'),
+    'the view dropdown must be re-rendered on a remote view change; ids: ' + JSON.stringify(idsRequested),
+  );
+  assert.ok(
+    idsRequested.includes('session-grid'),
+    'the grid must be re-rendered on a remote view change; ids: ' + JSON.stringify(idsRequested),
+  );
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.fetch = undefined;
+  app._setActiveView('all');
+});
+
+test('unchanged remote active_view is a no-op (no re-render churn, no PATCH)', async () => {
+  const calls = [];
+  const idsRequested = [];
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => { idsRequested.push(id); return null; };
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    if (method === 'GET' && url === '/api/state') {
+      return { ok: true, json: async () => ({ active_session: null, active_remote_id: null, active_view: 'all' }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+
+  app._setActiveView('all');
+  app._setViewMode('grid');
+  app._setViewingSession(null);
+
+  await app.pollActiveState();
+  await new Promise((r) => setTimeout(r, 25));
+
+  assert.strictEqual(app._getActiveView(), 'all', 'view must stay unchanged');
+  assert.ok(
+    !calls.some((c) => c.startsWith('PATCH ')),
+    'no PATCH may fire on an unchanged view; calls: ' + JSON.stringify(calls),
+  );
+  assert.strictEqual(
+    idsRequested.length, 0,
+    'no DOM re-render may occur on an unchanged view; ids: ' + JSON.stringify(idsRequested),
+  );
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.fetch = undefined;
+});
+
+test('followRemoteActiveView no-ops on null state or missing active_view', () => {
+  app._setActiveView('all');
+  // Would throw if it tried to render/apply — fetch is undefined here
+  app.followRemoteActiveView(null);
+  app.followRemoteActiveView({ active_session: 'beta', active_remote_id: null });
+  assert.strictEqual(app._getActiveView(), 'all', 'view must remain unchanged when active_view is absent');
+});
+
+test('user-initiated switchView still PATCHes /api/state (local switches must propagate)', async () => {
+  const calls = [];
+  const bodies = [];
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = () => null;
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    if (opts && opts.body) bodies.push(opts.body);
+    return { ok: true, json: async () => ({}) };
+  };
+
+  app.switchView('focus');
+  await new Promise((r) => setTimeout(r, 25)); // flush fire-and-forget PATCH
+
+  assert.strictEqual(app._getActiveView(), 'focus', 'switchView must apply locally');
+  assert.ok(
+    calls.includes('PATCH /api/state'),
+    'switchView must persist the view server-globally; calls: ' + JSON.stringify(calls),
+  );
+  assert.ok(
+    bodies.some((b) => b.includes('"active_view":"focus"')),
+    'the PATCH body must carry the new active_view; bodies: ' + JSON.stringify(bodies),
+  );
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.fetch = undefined;
+  app._setActiveView('all');
+});
+
+// --- followRemoteViewDefinitions (PWA follows external view-MEMBERSHIP change) ---
+// Same class of bug as followRemoteActiveView (which follows the active
+// *selection*), one layer deeper: view membership data (_serverSettings.views)
+// was fetched exactly once at page load and never refreshed, so adding a
+// session to a view on another device (deck, agent, another tab) never
+// showed up until a hard page reload. settings_updated_at (now carried on
+// every /api/state poll) is the efficient change signal used instead of a
+// blind per-second /api/settings re-fetch.
+
+test('pollActiveState wires followRemoteViewDefinitions alongside the other two follows', () => {
+  const src = app.pollActiveState.toString();
+  assert.ok(src.includes('followRemoteViewDefinitions'), 'pollActiveState must call followRemoteViewDefinitions');
+  assert.ok(src.includes('followRemoteActiveSession'), 'session-follow must remain wired');
+  assert.ok(src.includes('followRemoteActiveView'), 'view-follow must remain wired');
+});
+
+test('followRemoteViewDefinitions never PATCHes (render-only, no re-PATCH contract)', () => {
+  assert.ok(
+    !app.followRemoteViewDefinitions.toString().includes('PATCH'),
+    'followRemoteViewDefinitions must not PATCH -- it applies a settings snapshot it just received FROM the server',
+  );
+});
+
+test('changed settings_updated_at triggers exactly one /api/settings re-fetch and re-renders view-dependent UI', async () => {
+  const calls = [];
+  const idsRequested = [];
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => { idsRequested.push(id); return null; };
+  const updatedSettings = { views: [{ name: 'Focus', sessions: ['test-input-session'] }], hidden_sessions: [] };
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    if (method === 'GET' && url === '/api/settings') {
+      return { ok: true, json: async () => updatedSettings };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+
+  app._setActiveView('Focus');
+
+  await app.followRemoteViewDefinitions({ settings_updated_at: 12345 });
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.strictEqual(
+    calls.filter((c) => c === 'GET /api/settings').length, 1,
+    'exactly one settings re-fetch must fire; calls: ' + JSON.stringify(calls),
+  );
+  assert.ok(
+    !calls.some((c) => c.startsWith('PATCH ')),
+    'the refresh path must never PATCH; calls: ' + JSON.stringify(calls),
+  );
+  assert.ok(
+    idsRequested.includes('view-dropdown-menu'),
+    'the view dropdown must be re-rendered on a settings change; ids: ' + JSON.stringify(idsRequested),
+  );
+  assert.ok(
+    idsRequested.includes('session-grid'),
+    'the grid (filtered session list) must be re-rendered on a settings change; ids: ' + JSON.stringify(idsRequested),
+  );
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.fetch = undefined;
+  app._setActiveView('all');
+});
+
+test('unchanged settings_updated_at is a no-op (no fetch, no re-render, no churn)', async () => {
+  const calls = [];
+  const idsRequested = [];
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = (id) => { idsRequested.push(id); return null; };
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    return { ok: true, json: async () => ({}) };
+  };
+
+  // Seed baseline, then poll with the SAME timestamp.
+  await app.followRemoteViewDefinitions({ settings_updated_at: 999 });
+  calls.length = 0;
+  idsRequested.length = 0;
+
+  await app.followRemoteViewDefinitions({ settings_updated_at: 999 });
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.strictEqual(calls.length, 0, 'unchanged timestamp must not fetch anything; calls: ' + JSON.stringify(calls));
+  assert.strictEqual(idsRequested.length, 0, 'unchanged timestamp must not re-render; ids: ' + JSON.stringify(idsRequested));
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.fetch = undefined;
+});
+
+test('missing settings_updated_at (older server) is treated as no signal -- no crash, no fetch', async () => {
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    calls.push(((opts && opts.method) || 'GET') + ' ' + url);
+    return { ok: true, json: async () => ({}) };
+  };
+
+  assert.doesNotThrow(() => { app.followRemoteViewDefinitions({ active_session: null, active_view: 'all' }); });
+  assert.doesNotThrow(() => { app.followRemoteViewDefinitions(null); });
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.strictEqual(calls.length, 0, 'absent settings_updated_at must not trigger any fetch; calls: ' + JSON.stringify(calls));
+
+  globalThis.fetch = undefined;
+});
+
+test('after refresh, a session newly added to a view on another device is reflected in the filtered/membership view (the reported symptom)', async () => {
+  const origGetById = globalThis.document.getElementById;
+  globalThis.document.getElementById = () => null;
+  const updatedSettings = { views: [{ name: 'Focus', sessions: ['device1:test-input-session'] }], hidden_sessions: [] };
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    if (method === 'GET' && url === '/api/settings') {
+      return { ok: true, json: async () => updatedSettings };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+
+  // Simulate stale state: the session is NOT in the cached view before the follow fires.
+  app._setServerSettings({ views: [{ name: 'Focus', sessions: [] }], hidden_sessions: [] });
+
+  await app.followRemoteViewDefinitions({ settings_updated_at: 55555 });
+  await new Promise((r) => setTimeout(r, 10));
+
+  const refreshed = app._getServerSettings();
+  const focusView = refreshed.views.find((v) => v.name === 'Focus');
+  assert.ok(
+    focusView && focusView.sessions.indexOf('device1:test-input-session') !== -1,
+    'the newly-added session must appear in the refreshed view membership without a page reload',
+  );
+
+  globalThis.document.getElementById = origGetById;
+  globalThis.fetch = undefined;
+});
+
+// --- patchSettingsGuarded (settings-clobber CAS protection) ---
+// Real incident this fixes: a PWA tab holding a STALE _serverSettings.views
+// snapshot PATCHed the entire array back over the server's newer state,
+// destroying 7 of 8 views in one request. The server now accepts an
+// OPTIONAL expected_settings_updated_at precondition (see main.py's
+// update_settings()) and rejects a stale write with 409, no mutation.
+// patchSettingsGuarded is the one place that precondition is attached and
+// the 409 retry is handled.
+
+test('patchSettingsGuarded attaches expected_settings_updated_at to the PATCH body', async () => {
+  const patchBodies = [];
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    if (method === 'PATCH' && url === '/api/settings') {
+      patchBodies.push(JSON.parse(opts.body));
+      return { ok: true, json: async () => ({ views: [], settings_updated_at: 42 }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+
+  app._setServerSettings({ views: [], settings_updated_at: 42 });
+  await app.patchSettingsGuarded(() => ({ views: [{ name: 'X', sessions: [] }] }));
+
+  assert.strictEqual(patchBodies.length, 1);
+  assert.ok(
+    Object.prototype.hasOwnProperty.call(patchBodies[0], 'expected_settings_updated_at'),
+    'PATCH body must include expected_settings_updated_at: ' + JSON.stringify(patchBodies[0]),
+  );
+
+  globalThis.fetch = undefined;
+});
+
+test('a views-touching patch pre-fetches once, then a single 409 triggers one more re-fetch, one re-apply, and one retry', async () => {
+  const calls = [];
+  let patchAttempts = 0;
+  const serverViews = [{ name: 'Focus', sessions: ['a', 'b', 'c'] }];
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    if (method === 'GET' && url === '/api/settings') {
+      return { ok: true, json: async () => ({ views: serverViews, settings_updated_at: 100 }) };
+    }
+    if (method === 'PATCH' && url === '/api/settings') {
+      patchAttempts += 1;
+      if (patchAttempts === 1) {
+        return { ok: false, status: 409, statusText: 'Conflict', json: async () => ({ settings_updated_at: 100 }) };
+      }
+      return { ok: true, json: async () => ({ views: JSON.parse(opts.body).views, settings_updated_at: 101 }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+
+  // Seed a STALE baseline (different from what the "GET" mock returns).
+  app._setServerSettings({ views: [{ name: 'Focus', sessions: ['a'] }], settings_updated_at: 1 });
+
+  const mutateCalls = [];
+  const result = await app.patchSettingsGuarded((fresh) => {
+    mutateCalls.push(JSON.parse(JSON.stringify(fresh)));
+    const views = (fresh && fresh.views) || [];
+    return { views: views.map((v) => ({ name: v.name, sessions: v.sessions.concat(['d']) })) };
+  });
+
+  assert.strictEqual(
+    calls.filter((c) => c === 'PATCH /api/settings').length, 2,
+    'must attempt PATCH exactly twice (original + one retry); calls: ' + JSON.stringify(calls),
+  );
+  // Two GETs total: one PROACTIVE re-fetch because the patch touches `views`
+  // (detected from the mutateFn's own draft output, before the first PATCH
+  // is ever sent), and one more after the 409 (the pre-existing CAS-retry
+  // re-fetch). Never operating on the stale seeded baseline is exactly the
+  // point of the fix -- see patchSettingsGuarded's docstring.
+  assert.strictEqual(
+    calls.filter((c) => c === 'GET /api/settings').length, 2,
+    'a views-touching patch re-fetches once proactively and once after the 409; calls: ' + JSON.stringify(calls),
+  );
+  // mutateFn runs 3 times: once against the stale seed (to detect that the
+  // draft touches `views`, discarded), once against the freshly re-fetched
+  // copy (the actual first PATCH attempt), and once more on the retry
+  // (which reuses the already-fresh copy from the 409 handler, so no third
+  // re-fetch is needed).
+  assert.strictEqual(mutateCalls.length, 3, 'mutateFn is called once to detect intent, once fresh, once on retry');
+  assert.deepStrictEqual(
+    mutateCalls[0].views, [{ name: 'Focus', sessions: ['a'] }],
+    'the first (detection) call sees whatever baseline was on hand, stale or not',
+  );
+  assert.deepStrictEqual(
+    mutateCalls[1].views, serverViews,
+    'the proactive re-fetch rebuilds the patch from the FRESH snapshot before ever sending it',
+  );
+  assert.deepStrictEqual(
+    mutateCalls[2].views, serverViews,
+    'the retry after the 409 also uses fresh data (unchanged from the proactive fetch in this scenario)',
+  );
+  assert.deepStrictEqual(result.views, [{ name: 'Focus', sessions: ['a', 'b', 'c', 'd'] }]);
+
+  globalThis.fetch = undefined;
+});
+
+test('a second consecutive 409 does not loop -- exactly two PATCH attempts, then rejects', async () => {
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    calls.push(method + ' ' + url);
+    if (method === 'GET' && url === '/api/settings') {
+      return { ok: true, json: async () => ({ views: [], settings_updated_at: 5 }) };
+    }
+    if (method === 'PATCH' && url === '/api/settings') {
+      return { ok: false, status: 409, statusText: 'Conflict', json: async () => ({ settings_updated_at: 5 }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+
+  app._setServerSettings({ views: [], settings_updated_at: 1 });
+
+  await assert.rejects(
+    () => app.patchSettingsGuarded(() => ({ views: [] })),
+    (err) => err.status === 409,
+    'a persisting conflict must reject with the 409 error, not loop forever',
+  );
+
+  assert.strictEqual(
+    calls.filter((c) => c === 'PATCH /api/settings').length, 2,
+    'must not attempt a third PATCH after a second consecutive 409; calls: ' + JSON.stringify(calls),
+  );
+  // Three GETs: one proactive (patch touches `views`), one after the first
+  // 409 (CAS-retry re-fetch), one after the second/final 409 (re-render
+  // from server truth). The retry attempt itself does not proactively
+  // re-fetch again since it already has fresh data from the 409 handler.
+  assert.strictEqual(
+    calls.filter((c) => c === 'GET /api/settings').length, 3,
+    'a views-touching patch that keeps conflicting re-fetches proactively once, then once per 409; calls: ' + JSON.stringify(calls),
+  );
+
+  globalThis.fetch = undefined;
+});
+
+test('a successful PATCH updates the baseline used by the NEXT guarded write', async () => {
+  const patchBodies = [];
+  let responseTs = 200;
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    if (method === 'PATCH' && url === '/api/settings') {
+      patchBodies.push(JSON.parse(opts.body));
+      return { ok: true, json: async () => ({ views: [], settings_updated_at: responseTs }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+
+  app._setServerSettings({ views: [], settings_updated_at: 1 });
+
+  await app.patchSettingsGuarded(() => ({ views: [] }));
+  responseTs = 201;
+  await app.patchSettingsGuarded(() => ({ views: [] }));
+
+  assert.strictEqual(patchBodies.length, 2);
+  assert.strictEqual(
+    patchBodies[1].expected_settings_updated_at, 200,
+    'the second guarded write must send the baseline from the FIRST write\'s response, not the original seed',
+  );
+
+  globalThis.fetch = undefined;
+});
+
+test('a view-membership toggle through _saveViewsAndRerender produces the correct merged views array', async () => {
+  globalThis.fetch = async (url, opts) => {
+    const method = (opts && opts.method) || 'GET';
+    if (method === 'PATCH' && url === '/api/settings') {
+      const body = JSON.parse(opts.body);
+      return { ok: true, json: async () => ({ views: body.views, settings_updated_at: 999 }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+
+  app._setServerSettings({ views: [{ name: 'Focus', sessions: ['a'] }], settings_updated_at: 1 });
+
+  await app._saveViewsAndRerender([{ name: 'Focus', sessions: ['a', 'b'] }, { name: 'Other', sessions: [] }]);
+
+  const after = app._getServerSettings();
+  assert.deepStrictEqual(after.views, [
+    { name: 'Focus', sessions: ['a', 'b'] },
+    { name: 'Other', sessions: [] },
+  ]);
+
+  globalThis.fetch = undefined;
 });

@@ -11,6 +11,9 @@ permissions:
 
 jobs:
   test:
+    # Tests against uv.lock's pinned versions -- a stable, reproducible dev
+    # baseline. This is NOT a proxy for "what ships to users" -- see the
+    # test-latest-deps job below for why a second job exists for that.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -33,3 +36,135 @@ jobs:
 
       - name: Run tests
         run: uv run pytest -v
+
+  test-client:
+    # muxplex-client (client/) is a separate uv workspace member and PyPI
+    # distribution (see client/pyproject.toml, muxplex-client-design.md) with
+    # its OWN pytest config (`testpaths = ["tests"]`, scoped to client/tests).
+    # The `test` job above runs from the repo root, whose testpaths is
+    # `["muxplex/tests"]` -- it NEVER collects client/tests, so the client's
+    # 44 pure unit tests (test_protocol.py, test_sentinel.py) silently never
+    # ran in CI. This is the same shape of blind spot `test-frontend` closed
+    # for the JS suite: a real, dedicated test suite that nothing executed.
+    #
+    # A dedicated job (not a widened root `testpaths`) is deliberate:
+    # - Keeps each package's pytest config authoritative for its own tests
+    #   (root `addopts = "-m 'not integration'"` and the `integration`
+    #   marker are muxplex-server concerns; the client suite is pure/networkless
+    #   and has no markers of its own -- mixing configs would couple them for
+    #   no benefit).
+    # - Mirrors `test-frontend`'s pattern: one job per distribution/ecosystem,
+    #   named for what it covers, independently green/red in the Actions UI.
+    # - Orthogonal to `test-latest-deps`: that job exists to catch dependency
+    #   *resolution* drift between `uv.lock` and a fresh `uv tool install`-style
+    #   resolve for the SERVER's heavier dependency set (fastapi/uvicorn/etc).
+    #   The client's only dependency is `httpx`, resolved from the same
+    #   `uv sync` as this job already uses -- there is no comparable drift
+    #   surface here, so this job runs against `uv.lock` only, same as `test`.
+    #
+    # Matrixed across the same Python versions as `test` because
+    # muxplex-client is itself a published PyPI package supporting 3.11-3.13
+    # (see client/pyproject.toml's classifiers) -- its own compatibility
+    # promise, independent of the server's.
+    name: test (muxplex-client package)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies (workspace sync, includes client/)
+        run: uv sync --extra dev
+
+      - name: Run muxplex-client tests
+        run: uv run --directory client pytest -v
+
+  test-latest-deps:
+    # Real incident this closes (2026-07): uv.lock pinned uvicorn 0.42.0 /
+    # websockets 16.0 (uvicorn's legacy websocket ASGI implementation), so
+    # this job's sibling above -- and the DTU, which also installs from
+    # uv.lock -- stayed green. Every real `uv tool install muxplex` (how
+    # this project is actually shipped and installed) does NOT read
+    # uv.lock at all: it re-resolves against pyproject.toml's version
+    # floors and picks whatever is newest on PyPI, which resolved uvicorn
+    # 0.51.0 / websockets 16.1.1 (the newer 'sansio' ASGI implementation).
+    # A WebSocket RuntimeError reproduced ONLY on the sansio impl, so CI
+    # and the DTU were both green while production threw it hourly for a
+    # full day before anyone traced it to the version split.
+    #
+    # This job installs the same way `uv tool install` does -- a fresh
+    # resolution with NO lock file involved -- so that class of drift is
+    # caught here instead of discovered in production. Do not "simplify"
+    # this into `uv sync`; that reintroduces exactly the blind spot above.
+    # One Python version is enough (the point is catching dependency
+    # drift, not re-running the full version matrix); see AGENTS.md ->
+    # "Testing & workflow" for the full incident writeup.
+    name: test (latest resolvable deps, mirrors `uv tool install`)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.13
+        run: uv python install 3.13
+
+      - name: Install dependencies (fresh resolve, no lock -- mirrors `uv tool install`)
+        run: |
+          uv venv .venv-latest --python 3.13
+          uv pip install --python .venv-latest/bin/python -e ".[dev]"
+          .venv-latest/bin/python -c "import uvicorn, websockets; print('uvicorn', uvicorn.__version__); print('websockets', websockets.__version__)"
+
+      - name: Run tests
+        run: .venv-latest/bin/python -m pytest -v
+
+  test-frontend:
+    # The two Python jobs above never execute a line of frontend code. All PWA
+    # logic lives in muxplex/frontend/ (app.js, terminal.js) and is covered by
+    # node:test suites under muxplex/frontend/tests/ -- which, until this job
+    # existed, ran ONLY when a human remembered to run them by hand.
+    #
+    # Concrete gap this closes (v0.15.1): a frontend-only fix shipped with a
+    # new regression test, and CI went green across all four Python jobs
+    # without ever executing that test. Same shape as the uv.lock drift that
+    # test-latest-deps exists to catch -- CI green while not testing the thing
+    # that actually changed.
+    #
+    # The glob is deliberate. `node --test tests/*.mjs` picks up every suite in
+    # the directory, so a newly added suite is covered the moment it lands
+    # rather than whenever someone remembers to list it here. It also fixes a
+    # silent gap in the previously-documented command
+    # (`node --test frontend/tests/test_app.mjs`), which named one file and so
+    # never ran test_terminal.mjs at all.
+    #
+    # No install step and no package.json by design: these suites have zero
+    # package dependencies and use only node: builtins.
+    name: test (frontend, node:test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run frontend tests
+        working-directory: muxplex/frontend
+        run: node --test tests/*.mjs

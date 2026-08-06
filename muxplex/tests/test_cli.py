@@ -40,6 +40,7 @@ def test_main_calls_serve_by_default(mock_check_deps):
             session_ttl=None,
             tls_cert=None,
             tls_key=None,
+            force_take_port=False,
         )
 
 
@@ -57,6 +58,7 @@ def test_main_passes_custom_host_and_port(mock_check_deps):
             session_ttl=None,
             tls_cert=None,
             tls_key=None,
+            force_take_port=False,
         )
 
 
@@ -85,6 +87,7 @@ def test_main_passes_auth_flag(mock_check_deps):
             session_ttl=None,
             tls_cert=None,
             tls_key=None,
+            force_take_port=False,
         )
 
 
@@ -102,6 +105,7 @@ def test_main_passes_session_ttl_flag(mock_check_deps):
             session_ttl=3600,
             tls_cert=None,
             tls_key=None,
+            force_take_port=False,
         )
 
 
@@ -375,6 +379,78 @@ def test_main_dispatches_to_doctor(monkeypatch):
     assert len(calls) == 1, (
         "doctor() must be called once when 'doctor' subcommand is used"
     )
+
+
+# ---------------------------------------------------------------------------
+# `muxplex env` subcommand
+# ---------------------------------------------------------------------------
+
+
+def test_main_dispatches_to_env(monkeypatch):
+    """main() with 'env' subcommand must invoke cmd_env()."""
+    from muxplex.cli import main
+
+    calls = []
+    monkeypatch.setattr("muxplex.cli.cmd_env", lambda: calls.append(True))
+
+    with patch("sys.argv", ["muxplex", "env"]):
+        main()
+
+    assert len(calls) == 1, (
+        "cmd_env() must be called once when 'env' subcommand is used"
+    )
+
+
+def test_cmd_env_prints_only_the_export_line_on_stdout(tmp_path, monkeypatch, capsys):
+    """cmd_env() prints exactly the export line on stdout -- nothing else (eval-safety)."""
+    import muxplex.settings as settings_mod
+    from muxplex.cli import cmd_env
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.setenv("TMUX_TMPDIR", "/configured/via/env")
+
+    cmd_env()
+
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    assert lines == ['export TMUX_TMPDIR="/configured/via/env"']
+    # Human-facing notes go to stderr, not stdout.
+    assert captured.out.count("\n") == 1
+
+
+def test_cmd_env_uses_configured_tmux_socket_dir(tmp_path, monkeypatch, capsys):
+    """cmd_env() prefers the explicit tmux_socket_dir setting over the environment."""
+    import json
+
+    import muxplex.settings as settings_mod
+    from muxplex.cli import cmd_env
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_path)
+    settings_path.write_text(json.dumps({"tmux_socket_dir": "/configured/socket/dir"}))
+    monkeypatch.setenv("TMUX_TMPDIR", "/should/be/ignored")
+
+    cmd_env()
+
+    captured = capsys.readouterr()
+    assert captured.out == 'export TMUX_TMPDIR="/configured/socket/dir"\n'
+
+
+def test_cmd_env_falls_back_to_tmux_default_when_nothing_configured(
+    tmp_path, monkeypatch, capsys
+):
+    """cmd_env() never prints an empty TMUX_TMPDIR -- falls back to tmux's own default."""
+    import muxplex.settings as settings_mod
+    from muxplex.cli import cmd_env
+
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", tmp_path / "settings.json")
+    monkeypatch.delenv("TMUX_TMPDIR", raising=False)
+
+    cmd_env()
+
+    captured = capsys.readouterr()
+    assert captured.out.startswith('export TMUX_TMPDIR="/tmp/tmux-')
+    assert captured.out.strip() != 'export TMUX_TMPDIR=""'
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +807,7 @@ def test_main_passes_none_for_unset_flags(mock_check_deps):
             session_ttl=None,
             tls_cert=None,
             tls_key=None,
+            force_take_port=False,
         )
 
 
@@ -748,6 +825,7 @@ def test_main_passes_explicit_host_only(mock_check_deps):
             session_ttl=None,
             tls_cert=None,
             tls_key=None,
+            force_take_port=False,
         )
 
 
@@ -767,6 +845,7 @@ def test_main_serve_subcommand_accepts_flags(mock_check_deps):
             session_ttl=None,
             tls_cert=None,
             tls_key=None,
+            force_take_port=False,
         )
 
 
@@ -813,6 +892,88 @@ def test_doctor_shows_serve_config(tmp_path, monkeypatch, capsys):
     assert "0.0.0.0" in out
     assert "9999" in out
     assert "password" in out
+
+
+# ---------------------------------------------------------------------------
+# doctor(): running vs installed version
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_shows_running_version_match(tmp_path, monkeypatch, capsys):
+    """doctor() must report the running version matches installed when they're equal."""
+    import json
+    from importlib.metadata import version as pkg_version
+
+    import muxplex.cli as cli_mod
+    import muxplex.settings as settings_mod
+
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"host": "127.0.0.1", "port": 8088}))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_file)
+
+    installed_version = pkg_version("muxplex")
+    monkeypatch.setattr(
+        cli_mod,
+        "_fetch_local_instance_info",
+        lambda port, timeout=2.0: {"device_id": "abc", "version": installed_version},
+    )
+
+    cli_mod.doctor()
+
+    out = capsys.readouterr().out
+    assert "matches installed" in out
+
+
+def test_doctor_shows_running_version_mismatch(tmp_path, monkeypatch, capsys):
+    """doctor() must warn and point at a restart when running != installed version.
+
+    This is the exact gap that left a live server on v0.14.0 for hours after
+    the install moved to v0.15.0, with nothing anywhere saying so.
+    """
+    import json
+
+    import muxplex.cli as cli_mod
+    import muxplex.settings as settings_mod
+
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"host": "127.0.0.1", "port": 8088}))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_file)
+
+    monkeypatch.setattr(
+        cli_mod,
+        "_fetch_local_instance_info",
+        lambda port, timeout=2.0: {"device_id": "abc", "version": "0.0.1-stale"},
+    )
+
+    cli_mod.doctor()
+
+    out = capsys.readouterr().out
+    assert "0.0.1-stale" in out
+    assert "restart the service" in out
+    assert "muxplex upgrade" in out
+
+
+def test_doctor_shows_running_not_serving_distinctly(tmp_path, monkeypatch, capsys):
+    """doctor() must report 'not serving' plainly -- a normal state, not an error --
+    and that message must never be confused with the version-mismatch wording."""
+    import json
+
+    import muxplex.cli as cli_mod
+    import muxplex.settings as settings_mod
+
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"host": "127.0.0.1", "port": 8088}))
+    monkeypatch.setattr(settings_mod, "SETTINGS_PATH", settings_file)
+
+    monkeypatch.setattr(
+        cli_mod, "_fetch_local_instance_info", lambda port, timeout=2.0: None
+    )
+
+    cli_mod.doctor()
+
+    out = capsys.readouterr().out
+    assert "not serving" in out
+    assert "restart the service" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -1128,6 +1289,7 @@ def test_kill_stale_port_holder_exists():
     from muxplex.cli import _kill_stale_port_holder  # noqa: F401
 
 
+@pytest.mark.allow_real_port_killer
 def test_kill_stale_port_holder_runs_lsof(monkeypatch):
     """_kill_stale_port_holder must invoke lsof -ti :<port> to find occupying PIDs."""
     import subprocess
@@ -1151,6 +1313,7 @@ def test_kill_stale_port_holder_runs_lsof(monkeypatch):
     )
 
 
+@pytest.mark.allow_real_port_killer
 def test_kill_stale_port_holder_kills_foreign_pid(monkeypatch):
     """_kill_stale_port_holder must send SIGTERM to PIDs that are not our own."""
     import os
@@ -1172,6 +1335,11 @@ def test_kill_stale_port_holder_kills_foreign_pid(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setattr(os, "kill", fake_kill)
     monkeypatch.setattr(os, "getpid", lambda: 12345)  # not the same as foreign_pid
+    # Deterministic: never probe the real network. Without this the test would
+    # hit 127.0.0.1:8088 and flip its outcome on a machine actually running muxplex.
+    monkeypatch.setattr(
+        cli_mod, "_port_holder_is_healthy_muxplex", lambda *a, **k: False
+    )
 
     # Patch time.sleep so test doesn't actually sleep
     import time
@@ -1185,6 +1353,7 @@ def test_kill_stale_port_holder_kills_foreign_pid(monkeypatch):
     )
 
 
+@pytest.mark.allow_real_port_killer
 def test_kill_stale_port_holder_skips_own_pid(monkeypatch):
     """_kill_stale_port_holder must NOT kill its own PID."""
     import os
@@ -1210,6 +1379,7 @@ def test_kill_stale_port_holder_skips_own_pid(monkeypatch):
     assert my_pid not in killed, "_kill_stale_port_holder must not kill its own PID"
 
 
+@pytest.mark.allow_real_port_killer
 def test_kill_stale_port_holder_survives_lsof_not_available(monkeypatch):
     """_kill_stale_port_holder must not raise when lsof is unavailable."""
     import subprocess
@@ -1233,7 +1403,9 @@ def test_serve_calls_kill_stale_port_holder(tmp_path, monkeypatch):
 
     killed_ports = []
     monkeypatch.setattr(
-        cli_mod, "_kill_stale_port_holder", lambda port: killed_ports.append(port)
+        cli_mod,
+        "_kill_stale_port_holder",
+        lambda port, force=False: killed_ports.append(port),
     )
 
     with patch("uvicorn.run"):
@@ -1444,6 +1616,7 @@ def test_main_passes_tls_cert_and_key_flags(mock_check_deps):
             session_ttl=None,
             tls_cert="/path/cert.pem",
             tls_key="/path/key.pem",
+            force_take_port=False,
         )
 
 
@@ -1461,6 +1634,7 @@ def test_main_passes_none_for_unset_tls_flags(mock_check_deps):
             session_ttl=None,
             tls_cert=None,
             tls_key=None,
+            force_take_port=False,
         )
 
 
@@ -1573,6 +1747,7 @@ def test_serve_subcommand_accepts_tls_flags(mock_check_deps):
             session_ttl=None,
             tls_cert="/path/cert.pem",
             tls_key="/path/key.pem",
+            force_take_port=False,
         )
 
 
@@ -2889,7 +3064,9 @@ def test_find_uv_probes_known_locations_when_which_returns_none(tmp_path, monkey
     import muxplex.cli as cli_mod
 
     # Simulate shutil.which returning None for "uv"
-    monkeypatch.setattr(shutil, "which", lambda name: None if name == "uv" else f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        shutil, "which", lambda name: None if name == "uv" else f"/usr/bin/{name}"
+    )
 
     # Create a fake uv binary in a location that _find_uv() probes
     fake_uv = tmp_path / "uv"
@@ -2988,8 +3165,6 @@ def test_find_pip_probes_known_locations_when_which_returns_none(monkeypatch):
 
     monkeypatch.setattr(shutil, "which", lambda name: None)
 
-    import muxplex.cli as cli_mod
-
     def patched_find_pip():
         for name in ("pip", "pip3"):
             found = shutil.which(name)
@@ -3021,7 +3196,9 @@ def test_find_pip_returns_none_when_no_candidate_exists(monkeypatch):
     monkeypatch.setattr(_os, "access", lambda path, mode: False)
 
     result = cli_mod._find_pip()
-    assert result is None, "_find_pip must return None when pip cannot be found anywhere"
+    assert result is None, (
+        "_find_pip must return None when pip cannot be found anywhere"
+    )
 
 
 def test_upgrade_uses_find_uv_not_shutil_which(monkeypatch, capsys):
@@ -3043,7 +3220,9 @@ def test_upgrade_uses_find_uv_not_shutil_which(monkeypatch, capsys):
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     # shutil.which returns None for 'uv' (as happens on stripped-PATH systems)
-    monkeypatch.setattr(shutil, "which", lambda name: None if name == "uv" else f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        shutil, "which", lambda name: None if name == "uv" else f"/usr/bin/{name}"
+    )
     # but _find_uv() returns a path via the known-location fallback
     monkeypatch.setattr(cli_mod, "_find_uv", lambda: "/snap/bin/uv")
     monkeypatch.setattr(subprocess, "run", mock_run)
@@ -3058,7 +3237,9 @@ def test_upgrade_uses_find_uv_not_shutil_which(monkeypatch, capsys):
     with patch("muxplex.service.service_install", lambda: None):
         cli_mod.upgrade()
 
-    uv_calls = [c for c in calls if isinstance(c, list) and c and "/snap/bin/uv" in c[0]]
+    uv_calls = [
+        c for c in calls if isinstance(c, list) and c and "/snap/bin/uv" in c[0]
+    ]
     assert len(uv_calls) > 0, (
         "upgrade() must invoke the uv binary found by _find_uv() even when shutil.which returns None"
     )
@@ -3088,9 +3269,14 @@ def test_upgrade_exits_1_after_finally_recovers_stopped_service(monkeypatch, cap
         cmd_list = list(cmd) if isinstance(cmd, list) else [cmd]
         # Simulate pip install failing
         if cmd_list and "pip" in str(cmd_list[0]):
-            return type("R", (), {"returncode": 1, "stdout": "", "stderr": "pip install failed"})()
+            return type(
+                "R", (), {"returncode": 1, "stdout": "", "stderr": "pip install failed"}
+            )()
         # Simulate all other subprocess calls succeeding (systemctl is-active, start, etc.)
-        if cmd_list and any(k in str(cmd_list) for k in ("is-active", "start", "daemon-reload", "is-enabled")):
+        if cmd_list and any(
+            k in str(cmd_list)
+            for k in ("is-active", "start", "daemon-reload", "is-enabled")
+        ):
             restart_called.append(cmd_list)
             return type("R", (), {"returncode": 0, "stdout": "active", "stderr": ""})()
         return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
@@ -3098,9 +3284,11 @@ def test_upgrade_exits_1_after_finally_recovers_stopped_service(monkeypatch, cap
     # uv absent so we reach the pip path
     monkeypatch.setattr(cli_mod, "_find_uv", lambda: None)
     monkeypatch.setattr(cli_mod, "_find_pip", lambda: "/usr/bin/pip")
-    monkeypatch.setattr(shutil, "which", lambda name: (
-        "/usr/bin/systemctl" if name == "systemctl" else None
-    ))
+    monkeypatch.setattr(
+        shutil,
+        "which",
+        lambda name: "/usr/bin/systemctl" if name == "systemctl" else None,
+    )
     monkeypatch.setattr(subprocess, "run", mock_run)
     monkeypatch.setattr(
         cli_mod,
@@ -3178,7 +3366,9 @@ def test_upgrade_exits_1_if_service_fails_to_restart(monkeypatch, capsys):
 
     monkeypatch.setattr(subprocess, "run", mock_run)
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(cli_mod, "_check_for_update", lambda info: (True, "update available"))
+    monkeypatch.setattr(
+        cli_mod, "_check_for_update", lambda info: (True, "update available")
+    )
     monkeypatch.setattr(cli_mod, "_have_systemctl", lambda: True)
     monkeypatch.setattr(cli_mod, "_have_launchctl", lambda: False)
     # Service never becomes active (simulates the spark-1 dead-service scenario)
@@ -3211,7 +3401,9 @@ def test_upgrade_calls_daemon_reload_before_start(monkeypatch, capsys):
 
     monkeypatch.setattr(subprocess, "run", mock_run)
     monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(cli_mod, "_check_for_update", lambda info: (True, "update available"))
+    monkeypatch.setattr(
+        cli_mod, "_check_for_update", lambda info: (True, "update available")
+    )
     monkeypatch.setattr(cli_mod, "_have_systemctl", lambda: True)
     monkeypatch.setattr(cli_mod, "_have_launchctl", lambda: False)
     monkeypatch.setattr(cli_mod, "_verify_service_started", lambda timeout_s=10: True)
@@ -3275,9 +3467,7 @@ def test_doctor_reports_launchd_registered_but_not_serving(
     monkeypatch.setattr(
         subprocess,
         "run",
-        lambda *a, **kw: type(
-            "R", (), {"returncode": 0, "stdout": "", "stderr": ""}
-        )(),
+        lambda *a, **kw: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
     )
 
     # Port is NOT responding
@@ -3290,3 +3480,430 @@ def test_doctor_reports_launchd_registered_but_not_serving(
         f"doctor() must warn 'not serving' when launchd is registered but port is down;"
         f" got: {out!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# task: never SIGTERM a HEALTHY muxplex — probe before kill
+#
+# A silent kill of a live server is indistinguishable from a mystery outage:
+# it produces a clean graceful shutdown with no crash and no systemd "Stopping"
+# line. These tests pin the refusal behaviour.
+# ---------------------------------------------------------------------------
+
+
+def _fake_lsof(pid_out: str):
+    """subprocess.run stub returning *pid_out* as lsof stdout."""
+
+    def fake_run(cmd, **kw):
+        return type("R", (), {"returncode": 0, "stdout": pid_out, "stderr": ""})()
+
+    return fake_run
+
+
+@pytest.mark.allow_real_port_killer
+def test_kill_stale_port_holder_refuses_to_kill_healthy_server(monkeypatch, capsys):
+    """A responding muxplex must NOT be killed; startup must abort instead."""
+    import os
+    import subprocess
+    import muxplex.cli as cli_mod
+
+    killed = []
+    monkeypatch.setattr(subprocess, "run", _fake_lsof("4242\n"))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(os, "getpid", lambda: 12345)
+    monkeypatch.setattr(
+        cli_mod, "_port_holder_is_healthy_muxplex", lambda *a, **k: True
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli_mod._kill_stale_port_holder(8088)
+
+    assert exc.value.code != 0, "must exit non-zero rather than start"
+    assert killed == [], f"must NOT signal a healthy server, but sent: {killed}"
+    err = capsys.readouterr().err
+    assert "8088" in err, "message must name the port"
+    assert "4242" in err, "message must name the holder PID"
+    assert "--force-take-port" in err, "message must offer the override"
+
+
+@pytest.mark.allow_real_port_killer
+def test_kill_stale_port_holder_kills_unresponsive_holder(monkeypatch):
+    """A holder that does not answer the probe is stale — kill it as before."""
+    import os
+    import signal
+    import subprocess
+    import time
+    import muxplex.cli as cli_mod
+
+    killed = []
+    monkeypatch.setattr(subprocess, "run", _fake_lsof("4242\n"))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(os, "getpid", lambda: 12345)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        cli_mod, "_port_holder_is_healthy_muxplex", lambda *a, **k: False
+    )
+
+    cli_mod._kill_stale_port_holder(8088)
+
+    assert (4242, signal.SIGTERM) in killed
+
+
+@pytest.mark.allow_real_port_killer
+def test_kill_stale_port_holder_force_overrides_healthy_check(monkeypatch):
+    """--force-take-port must kill even a healthy server."""
+    import os
+    import signal
+    import subprocess
+    import time
+    import muxplex.cli as cli_mod
+
+    killed = []
+    monkeypatch.setattr(subprocess, "run", _fake_lsof("4242\n"))
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr(os, "getpid", lambda: 12345)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    monkeypatch.setattr(
+        cli_mod, "_port_holder_is_healthy_muxplex", lambda *a, **k: True
+    )
+
+    cli_mod._kill_stale_port_holder(8088, force=True)
+
+    assert (4242, signal.SIGTERM) in killed
+
+
+@pytest.mark.allow_real_port_killer
+def test_kill_stale_port_holder_no_holder_never_probes(monkeypatch):
+    """With nobody on the port there must be no probe and no signal."""
+    import os
+    import subprocess
+    import muxplex.cli as cli_mod
+
+    probed, killed = [], []
+
+    def fake_run(cmd, **kw):
+        return type("R", (), {"returncode": 1, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(pid))
+    monkeypatch.setattr(
+        cli_mod,
+        "_port_holder_is_healthy_muxplex",
+        lambda *a, **k: probed.append(True) or False,
+    )
+
+    cli_mod._kill_stale_port_holder(8088)
+
+    assert probed == [], "must not probe when no process holds the port"
+    assert killed == []
+
+
+@pytest.mark.allow_real_port_killer
+def test_kill_stale_port_holder_survives_missing_lsof(monkeypatch):
+    """A missing/raising lsof must never prevent startup."""
+    import subprocess
+    import muxplex.cli as cli_mod
+
+    def boom(cmd, **kw):
+        raise FileNotFoundError("lsof")
+
+    monkeypatch.setattr(subprocess, "run", boom)
+    cli_mod._kill_stale_port_holder(8088)  # must not raise
+
+
+def test_fetch_local_instance_info_returns_parsed_dict_on_200(monkeypatch):
+    """200 + JSON object body => the parsed dict is returned verbatim."""
+    import muxplex.cli as cli_mod
+
+    class FakeResp:
+        status = 200
+
+        def read(self):
+            return b'{"device_id": "abc", "version": "0.15.0", "name": "spark-1"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: FakeResp())
+    result = cli_mod._fetch_local_instance_info(8088)
+    assert result == {"device_id": "abc", "version": "0.15.0", "name": "spark-1"}
+
+
+def test_fetch_local_instance_info_returns_none_when_nothing_answers(monkeypatch):
+    """Refused/timeout on both schemes => None, not an exception."""
+    import muxplex.cli as cli_mod
+
+    def boom(*a, **k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    assert cli_mod._fetch_local_instance_info(8088) is None
+
+
+def test_fetch_local_instance_info_returns_none_for_non_dict_body(monkeypatch):
+    """A 200 response whose body isn't a JSON object (e.g. a bare list) => None."""
+    import muxplex.cli as cli_mod
+
+    class FakeResp:
+        status = 200
+
+        def read(self):
+            return b"[1, 2, 3]"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: FakeResp())
+    assert cli_mod._fetch_local_instance_info(8088) is None
+
+
+def test_port_holder_is_healthy_muxplex_uses_shared_fetch_decision_only(monkeypatch):
+    """After sharing the raw fetch, the healthy/unhealthy DECISION must be unchanged:
+    device_id + version present => healthy; either missing, or no data => not healthy.
+
+    This pins the deliberate design: _fetch_local_instance_info is a shared raw
+    fetch, but the safety-critical decision stays entirely in
+    _port_holder_is_healthy_muxplex.
+    """
+    import muxplex.cli as cli_mod
+
+    monkeypatch.setattr(
+        cli_mod,
+        "_fetch_local_instance_info",
+        lambda port, timeout=2.0: {"device_id": "x", "version": "1.0.0"},
+    )
+    assert cli_mod._port_holder_is_healthy_muxplex(8088) is True
+
+    monkeypatch.setattr(
+        cli_mod,
+        "_fetch_local_instance_info",
+        lambda port, timeout=2.0: {"hello": "world"},
+    )
+    assert cli_mod._port_holder_is_healthy_muxplex(8088) is False
+
+    monkeypatch.setattr(
+        cli_mod, "_fetch_local_instance_info", lambda port, timeout=2.0: None
+    )
+    assert cli_mod._port_holder_is_healthy_muxplex(8088) is False
+
+
+def test_port_holder_probe_true_for_real_instance_info(monkeypatch):
+    """200 + device_id + version => a healthy muxplex."""
+    import muxplex.cli as cli_mod
+
+    class FakeResp:
+        status = 200
+
+        def read(self):
+            return b'{"device_id": "abc", "version": "0.14.0", "name": "spark-1"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: FakeResp())
+    assert cli_mod._port_holder_is_healthy_muxplex(8088) is True
+
+
+def test_port_holder_probe_false_for_non_muxplex_json(monkeypatch):
+    """200 but the wrong shape => not a muxplex; do not treat as healthy."""
+    import muxplex.cli as cli_mod
+
+    class FakeResp:
+        status = 200
+
+        def read(self):
+            return b'{"hello": "world"}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: FakeResp())
+    assert cli_mod._port_holder_is_healthy_muxplex(8088) is False
+
+
+def test_port_holder_probe_false_when_connection_fails(monkeypatch):
+    """Refused/timeout on both schemes => stale holder, safe to kill."""
+    import muxplex.cli as cli_mod
+
+    def boom(*a, **k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    assert cli_mod._port_holder_is_healthy_muxplex(8088) is False
+
+
+def test_serve_parser_exposes_force_take_port():
+    """The --force-take-port escape hatch must exist on serve."""
+    import argparse
+    import muxplex.cli as cli_mod
+
+    parser = argparse.ArgumentParser()
+    cli_mod._add_serve_flags(parser)
+    args = parser.parse_args(["--force-take-port"])
+    assert args.force_take_port is True
+    assert parser.parse_args([]).force_take_port is False
+
+
+# ---------------------------------------------------------------------------
+# configure_logging() -- the accepted-/input-audit-line-never-fires fix
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _isolated_muxplex_logger():
+    """Snapshot/restore the real "muxplex" logger's handlers+level.
+
+    These tests deliberately mutate the actual "muxplex" package logger
+    (the same one every muxplex.* module logs through) to prove
+    configure_logging()'s real effect on it -- not a mock or a substitute
+    logger. Restoring afterward keeps this test isolated from every other
+    test in the suite that logs through muxplex.* loggers.
+    """
+    import logging as logging_mod
+
+    package_logger = logging_mod.getLogger("muxplex")
+    original_handlers = package_logger.handlers[:]
+    original_level = package_logger.level
+    package_logger.handlers.clear()
+    package_logger.setLevel(logging_mod.NOTSET)
+    try:
+        yield package_logger
+    finally:
+        package_logger.handlers.clear()
+        package_logger.handlers.extend(original_handlers)
+        package_logger.setLevel(original_level)
+
+
+def test_configure_logging_lets_accepted_audit_line_reach_a_real_handler(
+    _isolated_muxplex_logger,
+):
+    """Regression test for the audit-log-never-fires bug.
+
+    Before this fix, uvicorn.run(log_level="info") configured only
+    uvicorn's OWN loggers, never touching root or any muxplex.* logger.
+    An accepted /input call's audit `_log.info(...)` line therefore never
+    passed the effective-level gate and reached no handler at all.
+
+    This test deliberately does NOT use caplog.set_level()/at_level() --
+    that API forces the level itself and would pass even against the
+    broken code (see muxplex/tests/test_input.py's
+    test_audit_log_line_present_and_redacted, which does exactly that and
+    would not have caught this bug). Instead it starts from a pristine,
+    unconfigured "muxplex" logger, proves the pre-fix state is actually
+    broken, then calls the real production configure_logging() and proves
+    a log record travels all the way to an independently-attached handler
+    -- not just that isEnabledFor() flips.
+    """
+    import logging as logging_mod
+
+    from muxplex.cli import configure_logging
+
+    main_logger = logging_mod.getLogger("muxplex.main")
+
+    # Pre-fix state: nothing has configured this logger, so INFO records
+    # never pass the gate -- this is the actual bug, reproduced.
+    assert not main_logger.isEnabledFor(logging_mod.INFO), (
+        "test setup invalid: muxplex.main must start unconfigured"
+    )
+
+    configure_logging()
+
+    assert main_logger.isEnabledFor(logging_mod.INFO), (
+        "configure_logging() must raise muxplex.main's effective level to INFO"
+    )
+
+    captured: list[str] = []
+
+    class _Capture(logging_mod.Handler):
+        def emit(self, record: logging_mod.LogRecord) -> None:
+            captured.append(record.getMessage())
+
+    probe = _Capture()
+    _isolated_muxplex_logger.addHandler(probe)
+    try:
+        # Exercise the exact call shape used by the /input audit line.
+        main_logger.info("input: session=%r chars=%d", "alpha", 4)
+    finally:
+        _isolated_muxplex_logger.removeHandler(probe)
+
+    assert any("input: session='alpha' chars=4" in msg for msg in captured), (
+        f"accepted-input audit line must reach a real handler, got: {captured!r}"
+    )
+
+
+def test_configure_logging_does_not_widen_third_party_loggers(
+    _isolated_muxplex_logger,
+):
+    """Deliberately scoped to the "muxplex" namespace, not the root logger.
+
+    Configuring root wholesale would also raise unrelated dependency
+    loggers (httpx, websockets, ...) to INFO, turning the audit trail into
+    a noisy firehose. A sibling top-level logger must be unaffected.
+    """
+    import logging as logging_mod
+
+    from muxplex.cli import configure_logging
+
+    unrelated = logging_mod.getLogger("some_unrelated_dependency")
+    original_level = unrelated.level
+    unrelated.setLevel(logging_mod.NOTSET)
+    try:
+        configure_logging()
+        assert not unrelated.isEnabledFor(logging_mod.INFO), (
+            "configure_logging() must not raise unrelated loggers to INFO"
+        )
+    finally:
+        unrelated.setLevel(original_level)
+
+
+def test_configure_logging_is_idempotent(_isolated_muxplex_logger):
+    """Calling configure_logging() twice must not install duplicate handlers.
+
+    serve() may run more than once in a single process (e.g. across tests
+    or a supervised restart loop) -- repeated calls must not accumulate
+    handlers and duplicate every log line.
+    """
+    from muxplex.cli import configure_logging
+
+    configure_logging()
+    configure_logging()
+
+    audit_handlers = [
+        h for h in _isolated_muxplex_logger.handlers if h.name == "muxplex-audit"
+    ]
+    assert len(audit_handlers) == 1, (
+        f"expected exactly one audit handler, got {len(audit_handlers)}"
+    )
+
+
+def test_serve_calls_configure_logging(tmp_path, monkeypatch):
+    """serve() must configure logging before starting uvicorn.
+
+    Without this call, muxplex's own INFO-level logging (including the
+    /input audit line) is silently discarded once uvicorn.run() takes over.
+    """
+    import muxplex.cli as cli_mod
+
+    settings_file = tmp_path / "settings.json"
+    monkeypatch.setattr("muxplex.settings.SETTINGS_PATH", settings_file)
+
+    calls = []
+    monkeypatch.setattr(cli_mod, "configure_logging", lambda: calls.append(True))
+
+    with patch("uvicorn.run"):
+        with patch.dict("sys.modules", {"muxplex.main": MagicMock()}):
+            cli_mod.serve()
+
+    assert len(calls) == 1, "serve() must call configure_logging() exactly once"

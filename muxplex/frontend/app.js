@@ -113,6 +113,7 @@ function buildHeartbeatPayload(device_id, viewing_session, view_mode, last_inter
 
 // ─── Runtime constants ────────────────────────────────────────────────────────
 const POLL_MS = 2000;
+const STATE_POLL_MS = 1000;
 const HEARTBEAT_MS = 5000;
 const MOBILE_THRESHOLD = 600;
 
@@ -126,7 +127,20 @@ let _viewingSession = null;
 let _viewingRemoteId = '';
 let _viewMode = 'grid';
 let _lastInteractionAt = Date.now() / 1000;
+// Count of LOCAL session switches (sidebar/grid/sheet click, auto-open after
+// create) whose server-side write hasn't been confirmed yet. openSession()
+// sets _viewingSession synchronously, but the server's active_session doesn't
+// catch up until the /connect POST resolves AND the follow-up PATCH
+// /api/state settles -- a real window in which the dedicated ~1s state poll
+// (STATE_POLL_MS) can read the OLD value and, without this guard, mistake it
+// for a genuine remote switch and yank the user back to the session they just
+// switched away from. Incremented when a local switch begins, decremented
+// when its own write attempt settles (success or failure) -- driven by
+// actual completion, not a wall-clock guess, so it can't outlive the switch
+// it guards nor leak between unrelated switches.
+let _pendingLocalSwitches = 0;
 let _pollingTimer;
+let _statePollTimer;
 let _heartbeatTimer;
 let _notificationPermission = 'default';
 let _pollFailCount = 0;
@@ -220,6 +234,13 @@ function _buildFlyoutMenuItems() {
 // ─── Settings state ───────────────────────────────────────────────────────────
 let _settingsOpen = false;
 let _serverSettings = null;
+// Last-seen settings_updated_at (from /api/state's poll payload), used by
+// followRemoteViewDefinitions() to detect a settings change (e.g. view
+// membership edited on another device) without re-fetching /api/settings
+// every tick. Seeded from the initial loadServerSettings() at page load so
+// the very first poll doesn't trigger a redundant re-fetch. null means
+// "not yet seeded" (only true before the DOMContentLoaded init runs).
+let _lastSettingsUpdatedAt = null;
 let _gridViewMode = 'flat';
 let _activeFilterDevice = 'all';
 let _activeView = 'all';
@@ -262,6 +283,11 @@ let _domainFilter =
   (typeof window !== 'undefined' && window.location && window.location.pathname)
     ? parseDomainFilter(window.location.pathname)
     : null;
+
+// This server's own reported version (from /api/instance-info), for the
+// read-only "Version" field in Settings > Display. null until that fetch
+// resolves; never falls back to a guessed value.
+let _localVersion = null;
 const DISPLAY_DEFAULTS = {
   fontSize: 14,
   hoverPreviewDelay: 1500,
@@ -302,6 +328,16 @@ async function api(method, path, body) {
   if (!res.ok) {
     const err = new Error(`HTTP ${res.status}: ${res.statusText}`);
     err.status = res.status;
+    // Best-effort: attach the parsed error body so callers can distinguish
+    // WHY a 409 happened (e.g. patchSettingsGuarded telling a stale-baseline
+    // CAS conflict apart from a destructive-write backstop rejection --
+    // they require different recovery behavior). A non-JSON or empty body
+    // just leaves err.body undefined; callers already tolerate that.
+    try {
+      err.body = await res.json();
+    } catch (parseErr) {
+      // no-op: no usable JSON body on this error response
+    }
     throw err;
   }
   return res;
@@ -373,6 +409,7 @@ async function restoreState() {
       await openSession(state.active_session, {
         skipAnimation: true,
         remoteId: state.active_remote_id || '',
+        isFollow: true, // adopting server truth on load, not a fresh local decision
       });
     }
   } catch (err) {
@@ -412,6 +449,10 @@ async function pollSessions() {
     var endpoint = (_serverSettings && _serverSettings.multi_device_enabled)
       ? '/api/federation/sessions'
       : '/api/sessions';
+    // NOTE: session-follow (followRemoteActiveSession) deliberately does NOT
+    // live here. The federation fetch can take seconds when remotes are down
+    // (per-remote timeout x gather), which made deck->PWA follows ~8s late.
+    // The dedicated pollActiveState() loop owns following on a fresh snapshot.
     const res = await api('GET', endpoint);
     const sessions = await res.json();
     const prev = _currentSessions;
@@ -439,6 +480,121 @@ async function pollSessions() {
 }
 
 /**
+ * Follow a session switch made by another device (Stream Deck, agent, another
+ * browser). active_session/active_remote_id are server-global (last writer
+ * wins); when they change remotely we re-open the new session through the
+ * exact path restoreState() uses on page load — openSession() with
+ * skipAnimation — which re-renders the sidebar selection and re-attaches the
+ * terminal directly (no "Reconnecting…" overlay).
+ *
+ * Conservative policy (option a): only auto-follow when a session is already
+ * open in fullscreen (_viewingSession non-null). If the user is on the
+ * grid/overview, a remote switch does NOT yank them into fullscreen.
+ * Alternative (option b), if remote devices should fully drive the view:
+ * drop the _viewingSession guard so the grid also follows.
+ *
+ * Self-initiated switches naturally no-op: openSession() updates
+ * _viewingSession/_viewingRemoteId synchronously before its PATCH lands, so
+ * the next poll sees no difference.
+ *
+ * @param {object|null} state - GET /api/state body, or null on fetch failure
+ */
+function followRemoteActiveSession(state) {
+  if (!state || !state.active_session) return;
+  if (_viewingSession == null) return; // option (a): never force-open from the grid
+  var remoteId = state.active_remote_id || '';
+  if (state.active_session === _viewingSession && remoteId === _viewingRemoteId) return;
+  // A local switch may still be in flight (see _pendingLocalSwitches' comment):
+  // the server hasn't confirmed it yet, so THIS divergence is stale, not a
+  // genuine remote switch. Suppress until every in-flight local switch
+  // settles; once the server does catch up, the equality check above exits
+  // early on its own, so this guard never needs to be cleared explicitly.
+  if (_pendingLocalSwitches > 0) return;
+  // Same opts shape restoreState() uses (app.js restoreState) — skip the tile zoom animation.
+  // Fire-and-forget: must not delay the poll loop or count as a poll failure.
+  openSession(state.active_session, {
+    skipAnimation: true,
+    remoteId: remoteId,
+    isFollow: true,
+  }).catch(function (err) {
+    console.warn('[followRemoteActiveSession] could not follow remote switch:', err);
+  });
+}
+
+/**
+ * Follow a view switch made by another device — Stream Deck, agent, another
+ * browser — detected via the same /api/state poll that drives session-follow.
+ * active_view is server-global (last writer wins); this tab applies the
+ * received value locally and does NOT PATCH it back: we are echoing a value
+ * we just received FROM the server, so re-PATCHing would be redundant (and a
+ * feedback-loop hazard). User-initiated switches still PATCH via switchView().
+ *
+ * Self-initiated switches naturally no-op: switchView() updates _activeView
+ * synchronously before its PATCH lands, so the next poll sees no difference.
+ * An unknown/deleted view renders as honestly empty (filterVisible returns
+ * [] for a view it can't resolve) — same behavior as everywhere else.
+ *
+ * @param {object|null} state - GET /api/state body, or null on fetch failure
+ */
+function followRemoteActiveView(state) {
+  if (!state || !state.active_view) return;
+  if (state.active_view === _activeView) return;
+  applyViewLocally(state.active_view);
+}
+
+/**
+ * Follow a settings/view-DEFINITION change made by another device or tab \u2014
+ * e.g. a session added to (or removed from) a view via PATCH /api/settings.
+ * Same class of bug as followRemoteActiveView() (which follows the active
+ * *selection*), one layer deeper: this follows the view *membership data*
+ * itself, which previously was fetched exactly once at page load
+ * (loadServerSettings() in the DOMContentLoaded handler) and never refreshed,
+ * so _serverSettings.views went stale until a hard page reload.
+ *
+ * Uses settings_updated_at (now carried on every /api/state poll response,
+ * see main.py get_state()) as an efficient change signal instead of
+ * re-fetching /api/settings every tick: only when the timestamp actually
+ * differs from the last-seen value do we re-fetch (via the existing
+ * loadServerSettings(), no duplicated fetch logic) and re-render the
+ * view-dependent UI. An unchanged timestamp is a no-op \u2014 no fetch, no
+ * re-render, no per-second churn.
+ *
+ * Render-only, like followRemoteActiveView(): it NEVER PATCHes anything
+ * back. We are applying a settings snapshot we just received FROM the
+ * server, so writing it back would be redundant and a feedback-loop hazard.
+ * A tab's own settings PATCH also bumps settings_updated_at server-side, so
+ * the next poll re-fetches and re-renders once more \u2014 that's correct/
+ * idempotent (the server is authoritative) and matches what a second tab
+ * would see.
+ *
+ * Robust to an older server that doesn't send settings_updated_at: absence
+ * is treated as "no signal" \u2014 no fetch, no crash, no behavior change from
+ * before this function existed.
+ *
+ * @param {object|null} state - GET /api/state body, or null on fetch failure
+ * @returns {Promise<void>|undefined}
+ */
+function followRemoteViewDefinitions(state) {
+  if (!state) return;
+  var ts = state.settings_updated_at;
+  if (ts === undefined || ts === null) return; // older server: no signal
+  if (_lastSettingsUpdatedAt !== null && ts === _lastSettingsUpdatedAt) return; // unchanged
+  _lastSettingsUpdatedAt = ts;
+  return loadServerSettings().then(function() {
+    renderViewDropdown();
+    renderGrid(_currentSessions || []);
+    renderSidebar(_currentSessions || [], _viewingSession, _viewingRemoteId);
+    if (_settingsOpen) renderViewsSettingsTab();
+    var manageViewPanel = $('manage-view-panel');
+    if (manageViewPanel && !manageViewPanel.classList.contains('hidden')) {
+      renderManageViewList();
+    }
+  }).catch(function(err) {
+    console.warn('[followRemoteViewDefinitions] could not refresh settings:', err);
+  });
+}
+
+/**
  * Start the session polling loop. Guards against double-start.
  * Uses self-scheduling setTimeout so at most one poll is in-flight at a time.
  * If a poll takes longer than POLL_MS, the next poll starts POLL_MS after it
@@ -452,6 +608,48 @@ function startPolling() {
     _pollingTimer = setTimeout(pollLoop, POLL_MS);
   }
   pollLoop();
+}
+
+/**
+ * Dedicated lightweight follow poll: fetch ONLY /api/state (~3ms server-side)
+ * and hand the FRESH snapshot to followRemoteActiveSession().
+ *
+ * Deliberately independent of pollSessions(): when multi_device_enabled, the
+ * sessions poll fetches /api/federation/sessions, which blocks for the full
+ * per-remote timeout (seconds) whenever a federation remote is down. Following
+ * on that cadence made deck->PWA session switches take ~8s. This poll never
+ * touches federation, so a remote switch is detected within ~STATE_POLL_MS.
+ *
+ * Errors are swallowed (skip the tick): connection-status UI is owned by
+ * pollSessions(), and a transient /api/state failure just delays the follow
+ * by one tick.
+ * @returns {Promise<void>}
+ */
+async function pollActiveState() {
+  try {
+    const res = await api('GET', '/api/state');
+    const state = await res.json();
+    followRemoteActiveSession(state);
+    followRemoteActiveView(state);
+    followRemoteViewDefinitions(state);
+  } catch (err) {
+    // Transient failure: skip this tick; next one retries in STATE_POLL_MS.
+  }
+}
+
+/**
+ * Start the dedicated /api/state follow-poll loop. Guards against
+ * double-start. Self-scheduling setTimeout (same pattern as startPolling)
+ * so a slow response never overlaps the next tick.
+ */
+function startStatePolling() {
+  if (_statePollTimer) return;
+  _statePollTimer = true; // sentinel: prevents double-start before first setTimeout fires
+  async function statePollLoop() {
+    await pollActiveState();
+    _statePollTimer = setTimeout(statePollLoop, STATE_POLL_MS);
+  }
+  statePollLoop();
 }
 
 // ─── Grid rendering ──────────────────────────────────────────────────────────
@@ -560,6 +758,18 @@ function ansi256Color(n) {
 }
 
 /**
+ * Format a device's version for display (tooltip/badge text).
+ * Returns 'version unknown' for null/undefined/empty rather than falling
+ * back to any guessed value -- an unknown that looked like agreement with
+ * the local version would be worse than showing no data at all.
+ * @param {string|null|undefined} version
+ * @returns {string}
+ */
+function formatDeviceVersion(version) {
+  return version ? ('v' + version) : 'version unknown';
+}
+
+/**
  * Build the HTML string for a single session tile.
  * @param {object} session
  * @param {number} index
@@ -588,7 +798,7 @@ function buildTileHTML(session, index, mobile) {
   // Shown when multiple sources configured AND session has a device name
   let badgeHtml = '';
   if (_serverSettings && _serverSettings.multi_device_enabled && session.deviceName && ds.showDeviceBadges !== false) {
-    badgeHtml = `<span class="device-badge">${escapeHtml(session.deviceName)}</span>`;
+    badgeHtml = `<span class="device-badge" title="${escapeHtml(formatDeviceVersion(session.deviceVersion))}">${escapeHtml(session.deviceName)}</span>`;
   }
 
   // Last N lines of snapshot — show more in fit mode so tall tiles fill
@@ -928,7 +1138,7 @@ function buildSidebarHTML(session, currentSession, currentRemoteId) {
   // Device badge — shown in header line when multi_device_enabled
   let badgeHtml = '';
   if (_serverSettings && _serverSettings.multi_device_enabled && session.deviceName && ds.showDeviceBadges !== false) {
-    badgeHtml = `<span class="device-badge">${escapeHtml(session.deviceName)}</span>`;
+    badgeHtml = `<span class="device-badge" title="${escapeHtml(formatDeviceVersion(session.deviceVersion))}">${escapeHtml(session.deviceName)}</span>`;
   }
 
   // Last 20 lines of snapshot — trim trailing blanks from the FULL snapshot FIRST,
@@ -966,13 +1176,15 @@ function buildSidebarHTML(session, currentSession, currentRemoteId) {
  * @param {string} deviceName
  * @param {string} statusText
  * @param {string} statusClass
+ * @param {string|null} [deviceVersion] - remote's reported version, or null/undefined if unknown
  * @returns {string}
  */
-function buildStatusTileHTML(deviceName, statusText, statusClass) {
+function buildStatusTileHTML(deviceName, statusText, statusClass, deviceVersion) {
   return (
     '<article class="source-tile source-tile--' + statusClass + '">' +
     '<span class="source-tile__name">' + escapeHtml(deviceName || '') + '</span>' +
     '<span class="source-tile__badge">' + escapeHtml(statusText || '') + '</span>' +
+    '<span class="source-tile__version">' + escapeHtml(formatDeviceVersion(deviceVersion)) + '</span>' +
     '</article>'
   );
 }
@@ -1252,7 +1464,8 @@ function renderSidebar(sessions, currentSession, currentRemoteId) {
     }
 
     for (const [deviceName, deviceSessions] of groups) {
-      html += `<h4 class="sidebar-device-header">${escapeHtml(deviceName)}</h4>`;
+      const groupVersion = deviceSessions.length > 0 ? deviceSessions[0].deviceVersion : null;
+      html += `<h4 class="sidebar-device-header">${escapeHtml(deviceName)} <span class="sidebar-device-header__version">${escapeHtml(formatDeviceVersion(groupVersion))}</span></h4>`;
       html += deviceSessions.map((session) => buildSidebarHTML(session, currentSession, currentRemoteId)).join('');
     }
   } else {
@@ -1621,6 +1834,7 @@ function showNewViewInput() {
   input.placeholder = 'View name';
   input.maxLength = 30;
   input.setAttribute('aria-label', 'New view name');
+  _suppressAutofill(input);
 
   // Replace the '+ New View' button with the input
   newViewBtn.parentNode.replaceChild(input, newViewBtn);
@@ -1648,9 +1862,9 @@ function showNewViewInput() {
 
       // Create view and PATCH /api/settings
       var updatedViews = views.concat([{ name: name, sessions: [] }]);
-      api('PATCH', '/api/settings', { views: updatedViews })
-        .then(function() {
-          if (_serverSettings) _serverSettings.views = updatedViews;
+      patchSettingsGuarded(function() { return { views: updatedViews }; })
+        .then(function(body) {
+          if (_serverSettings) _serverSettings.views = body.views;
           switchView(name);
           openManageViewPanel();
         })
@@ -1699,6 +1913,7 @@ function showSidebarNewViewInput() {
   input.placeholder = 'View name';
   input.maxLength = 30;
   input.setAttribute('aria-label', 'New view name');
+  _suppressAutofill(input);
 
   // Replace the '+ New View' button with the input
   newViewBtn.parentNode.replaceChild(input, newViewBtn);
@@ -1732,9 +1947,9 @@ function showSidebarNewViewInput() {
 
       // Create view and PATCH /api/settings
       var updatedViews = views.concat([{ name: name, sessions: [] }]);
-      api('PATCH', '/api/settings', { views: updatedViews })
-        .then(function() {
-          if (_serverSettings) _serverSettings.views = updatedViews;
+      patchSettingsGuarded(function() { return { views: updatedViews }; })
+        .then(function(body) {
+          if (_serverSettings) _serverSettings.views = body.views;
           closeSidebarDropdown();
           switchView(name);
           openManageViewPanel();
@@ -1762,9 +1977,9 @@ function showSidebarNewViewInput() {
  * @param {Array} updatedViews - New views array to save.
  */
 function _saveViewsAndRerender(updatedViews) {
-  return api('PATCH', '/api/settings', { views: updatedViews })
-    .then(function() {
-      if (_serverSettings) _serverSettings.views = updatedViews;
+  return patchSettingsGuarded(function() { return { views: updatedViews }; })
+    .then(function(body) {
+      if (_serverSettings) _serverSettings.views = body.views;
       renderViewsSettingsTab();
       renderViewDropdown();
     })
@@ -1980,9 +2195,9 @@ function renderViewsSettingsTab() {
         return;
       }
       var updatedViews = views.concat([{ name: newName, sessions: [] }]);
-      api('PATCH', '/api/settings', { views: updatedViews })
-        .then(function() {
-          if (_serverSettings) _serverSettings.views = updatedViews;
+      patchSettingsGuarded(function() { return { views: updatedViews }; })
+        .then(function(body) {
+          if (_serverSettings) _serverSettings.views = body.views;
           renderViewsSettingsTab();
           renderViewDropdown();
           // Close settings and open Manage View panel for the new view
@@ -1999,13 +2214,14 @@ function renderViewsSettingsTab() {
 }
 
 /**
- * Switch to a named view. Updates _activeView, re-renders the grid and sidebar,
- * updates the dropdown label, and persists the change via PATCH /api/state.
+ * Apply a view change locally: update _activeView, re-render the grid and
+ * sidebar, and update the dropdown/sidebar labels. Does NOT touch the server.
+ * Shared by switchView() (user-initiated: PATCHes afterwards) and
+ * followRemoteActiveView() (server-initiated: must NOT PATCH back).
  * @param {string} viewName - 'all', 'hidden', or a user view name.
  */
-function switchView(viewName) {
+function applyViewLocally(viewName) {
   _activeView = viewName;
-  closeViewDropdown();
   renderGrid(_currentSessions || []);
   renderSidebar(_currentSessions || [], _viewingSession, _viewingRemoteId);
   renderViewDropdown();
@@ -2020,6 +2236,17 @@ function switchView(viewName) {
       sidebarLabel.textContent = viewName;
     }
   }
+}
+
+/**
+ * Switch to a named view (user-initiated). Applies the change locally via
+ * applyViewLocally() and persists it via PATCH /api/state — active_view is
+ * server-global, so this propagates to every other device (deck, other tabs).
+ * @param {string} viewName - 'all', 'hidden', or a user view name.
+ */
+function switchView(viewName) {
+  closeViewDropdown();
+  applyViewLocally(viewName);
   // Persist active view — fire and forget
   api('PATCH', '/api/state', { active_view: viewName }).catch(function() {});
 }
@@ -2047,8 +2274,8 @@ function renderGrid(sessions) {
     // produces no visible tile in any view mode (flat, grouped, or otherwise).
     var statusTilesHtml = '';
     (sessions || []).forEach(function(session) {
-      if (session.status === 'auth_failed') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Auth required', 'auth');
-      else if (session.status === 'unreachable') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Offline', 'offline');
+      if (session.status === 'auth_failed') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Auth required', 'auth', session.deviceVersion);
+      else if (session.status === 'unreachable') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Offline', 'offline', session.deviceVersion);
     });
     if (grid) grid.innerHTML = statusTilesHtml;
     // Only show empty-state when there are truly no tiles at all
@@ -2068,8 +2295,19 @@ function renderGrid(sessions) {
   var ordered;
   if (sortOrder === 'alphabetical') {
     ordered = visible.slice().sort(function(a, b) { return (a.name || '').localeCompare(b.name || ''); });
+  } else if (sortOrder === 'recent' && !mobile) {
+    // Sort by last_activity_at descending (most recently active first); sessions
+    // with no known activity timestamp sort last. Array.prototype.sort is stable,
+    // so ties (including sessions that are all null) preserve server-provided order.
+    ordered = visible.slice().sort(function(a, b) {
+      var aTime = a.last_activity_at;
+      var bTime = b.last_activity_at;
+      if (aTime == null) return bTime == null ? 0 : 1;
+      if (bTime == null) return -1;
+      return bTime - aTime;
+    });
   } else {
-    // 'recent', 'manual', and default use server-provided order; priority sort on mobile
+    // 'recent' (mobile), 'manual', and default use server-provided order; priority sort on mobile
     ordered = mobile ? sortByPriority(visible) : visible;
   }
 
@@ -2085,8 +2323,8 @@ function renderGrid(sessions) {
   // visible tile.  auth_failed and unreachable are actionable error states and are always shown.
   var statusTilesHtml = '';
   (sessions || []).forEach(function(session) {
-    if (session.status === 'auth_failed') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Auth required', 'auth');
-    else if (session.status === 'unreachable') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Offline', 'offline');
+    if (session.status === 'auth_failed') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Auth required', 'auth', session.deviceVersion);
+    else if (session.status === 'unreachable') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Offline', 'offline', session.deviceVersion);
   });
   if (grid) grid.innerHTML = html + statusTilesHtml;
 
@@ -2468,11 +2706,15 @@ function _openMobileViewPicker(sessionKey, sessionName, unhideFirst) {
       var checkEl = viewBtn.querySelector('span');
       if (checkEl) checkEl.textContent = nowIn ? '\u2713' : '\u00a0\u00a0';
 
-      api('PATCH', '/api/settings', patch)
-        .then(function() {
+      patchSettingsGuarded(function(fresh) {
+        return isAlreadyInView
+          ? removeSessionFromViewOp(fresh, view.name, sessionKey)
+          : addSessionToViewOp(fresh, view.name, sessionKey);
+      })
+        .then(function(body) {
           if (_serverSettings) {
-            _serverSettings.views = patch.views;
-            if (patch.hidden_sessions) _serverSettings.hidden_sessions = patch.hidden_sessions;
+            _serverSettings.views = body.views;
+            if (body.hidden_sessions) _serverSettings.hidden_sessions = body.hidden_sessions;
           }
           if (nowIn && patch.hidden_sessions) renderGrid(_currentSessions || []);
         })
@@ -2614,18 +2856,20 @@ function _openFlyoutSubmenu(triggerItem, unhideFirst) {
       // New-view creation: addSessionToViewOp doesn't model view creation, but
       // we use it on a temp settings (with the new view already appended) so
       // that the hidden_sessions update is expressed via the op layer.
-      var newView = { name: newName, sessions: [capturedKey] };
-      var newViews = existViews.concat([newView]);
-      var tempSettings = {
-        hidden_sessions: (_serverSettings && _serverSettings.hidden_sessions) || [],
-        views: newViews
-      };
-      var flyoutPatch = addSessionToViewOp(tempSettings, newName, capturedKey);
-      api('PATCH', '/api/settings', flyoutPatch)
-        .then(function() {
+      patchSettingsGuarded(function(fresh) {
+        var freshExistViews = (fresh && fresh.views) || [];
+        var newView = { name: newName, sessions: [capturedKey] };
+        var newViews = freshExistViews.concat([newView]);
+        var tempSettings = {
+          hidden_sessions: (fresh && fresh.hidden_sessions) || [],
+          views: newViews
+        };
+        return addSessionToViewOp(tempSettings, newName, capturedKey);
+      })
+        .then(function(body) {
           if (_serverSettings) {
-            _serverSettings.views = flyoutPatch.views;
-            _serverSettings.hidden_sessions = flyoutPatch.hidden_sessions;
+            _serverSettings.views = body.views;
+            _serverSettings.hidden_sessions = body.hidden_sessions;
           }
           switchView(newName);
         })
@@ -2646,18 +2890,15 @@ function _openFlyoutSubmenu(triggerItem, unhideFirst) {
     var sessions = view.sessions || [];
     var isAlreadyInView = sessions.indexOf(sessionKey) !== -1;
 
-    var patch;
-    if (isAlreadyInView) {
-      patch = removeSessionFromViewOp(_serverSettings, view.name, sessionKey);
-    } else {
-      patch = addSessionToViewOp(_serverSettings, view.name, sessionKey);
-    }
-
-    api('PATCH', '/api/settings', patch)
-      .then(function() {
+    patchSettingsGuarded(function(fresh) {
+      return isAlreadyInView
+        ? removeSessionFromViewOp(fresh, view.name, sessionKey)
+        : addSessionToViewOp(fresh, view.name, sessionKey);
+    })
+      .then(function(body) {
         if (_serverSettings) {
-          _serverSettings.views = patch.views;
-          if (patch.hidden_sessions) _serverSettings.hidden_sessions = patch.hidden_sessions;
+          _serverSettings.views = body.views;
+          if (body.hidden_sessions) _serverSettings.hidden_sessions = body.hidden_sessions;
         }
         // Update checkmarks in submenu
         if (_flyoutSubmenuEl) {
@@ -2671,7 +2912,7 @@ function _openFlyoutSubmenu(triggerItem, unhideFirst) {
             }
           }
         }
-        if (!isAlreadyInView && patch.hidden_sessions) {
+        if (!isAlreadyInView && body.hidden_sessions) {
           renderGrid(_currentSessions || []);
         }
       })
@@ -2690,15 +2931,13 @@ function _doHideSession() {
   var sessionKey = _flyoutSessionKey;
   if (!sessionKey) return;
 
-  var patch = hideSessionOp(_serverSettings, sessionKey);
-
   closeFlyoutMenu();
 
-  api('PATCH', '/api/settings', patch)
-    .then(function() {
+  patchSettingsGuarded(function(fresh) { return hideSessionOp(fresh, sessionKey); })
+    .then(function(body) {
       if (_serverSettings) {
-        _serverSettings.hidden_sessions = patch.hidden_sessions;
-        _serverSettings.views = patch.views;
+        _serverSettings.hidden_sessions = body.hidden_sessions;
+        _serverSettings.views = body.views;
       }
       renderGrid(_currentSessions || []);
       renderViewDropdown();
@@ -2721,13 +2960,11 @@ function _doUnhideSession() {
   var hidden = (_serverSettings && _serverSettings.hidden_sessions) || [];
   if (hidden.indexOf(sessionKey) === -1) { closeFlyoutMenu(); return; }
 
-  var patch = unhideSessionOp(_serverSettings, sessionKey);
-
   closeFlyoutMenu();
 
-  api('PATCH', '/api/settings', patch)
-    .then(function() {
-      if (_serverSettings) _serverSettings.hidden_sessions = patch.hidden_sessions;
+  patchSettingsGuarded(function(fresh) { return unhideSessionOp(fresh, sessionKey); })
+    .then(function(body) {
+      if (_serverSettings) _serverSettings.hidden_sessions = body.hidden_sessions;
       renderGrid(_currentSessions || []);
       renderViewDropdown();
     })
@@ -2745,13 +2982,11 @@ function _doRemoveFromView() {
   var sessionKey = _flyoutSessionKey;
   if (!sessionKey || _activeView === 'all' || _activeView === 'hidden') return;
 
-  var patch = removeSessionFromViewOp(_serverSettings, _activeView, sessionKey);
-
   closeFlyoutMenu();
 
-  api('PATCH', '/api/settings', patch)
-    .then(function() {
-      if (_serverSettings) _serverSettings.views = patch.views;
+  patchSettingsGuarded(function(fresh) { return removeSessionFromViewOp(fresh, _activeView, sessionKey); })
+    .then(function(body) {
+      if (_serverSettings) _serverSettings.views = body.views;
       renderGrid(_currentSessions || []);
     })
     .catch(function(err) {
@@ -2884,6 +3119,7 @@ function openManageViewPanel() {
       input.value = currentName;
       input.maxLength = 30;
       input.setAttribute('aria-label', 'View name');
+      _suppressAutofill(input);
       if (nameEl.parentNode) nameEl.parentNode.replaceChild(input, nameEl);
       input.focus();
       input.select();
@@ -2904,12 +3140,16 @@ function openManageViewPanel() {
           input.focus(); return;
         }
         _committed = true;
-        var updatedViews = views.map(function(v) {
-          return v.name === currentName ? { name: newName, sessions: v.sessions || [] } : v;
-        });
-        api('PATCH', '/api/settings', { views: updatedViews })
-          .then(function() {
-            if (_serverSettings) _serverSettings.views = updatedViews;
+        patchSettingsGuarded(function(fresh) {
+          var freshViews = (fresh && fresh.views) || [];
+          return {
+            views: freshViews.map(function(v) {
+              return v.name === currentName ? { name: newName, sessions: v.sessions || [] } : v;
+            })
+          };
+        })
+          .then(function(body) {
+            if (_serverSettings) _serverSettings.views = body.views;
             _activeView = newName;
             api('PATCH', '/api/state', { active_view: newName }).catch(function() {});
             renderViewDropdown();
@@ -2962,11 +3202,12 @@ function openManageViewPanel() {
       if (yesBtn) {
         yesBtn.onclick = function() {
           var viewToDelete = _activeView;
-          var views = (_serverSettings && _serverSettings.views) || [];
-          var updatedViews = views.filter(function(v) { return v.name !== viewToDelete; });
-          api('PATCH', '/api/settings', { views: updatedViews })
-            .then(function() {
-              if (_serverSettings) _serverSettings.views = updatedViews;
+          patchSettingsGuarded(function(fresh) {
+            var freshViews = (fresh && fresh.views) || [];
+            return { views: freshViews.filter(function(v) { return v.name !== viewToDelete; }) };
+          })
+            .then(function(body) {
+              if (_serverSettings) _serverSettings.views = body.views;
               closeManageViewPanel();
               switchView('all');
               showToast('View \'' + viewToDelete + '\' deleted');
@@ -3079,18 +3320,15 @@ function renderManageViewList() {
     var sessionKey = cb.dataset.sessionKey;
     var isChecked = cb.checked;
 
-    var patch;
-    if (isChecked) {
-      patch = addSessionToViewOp(_serverSettings, _activeView, sessionKey);
-    } else {
-      patch = removeSessionFromViewOp(_serverSettings, _activeView, sessionKey);
-    }
-
-    api('PATCH', '/api/settings', patch)
-      .then(function() {
+    patchSettingsGuarded(function(fresh) {
+      return isChecked
+        ? addSessionToViewOp(fresh, _activeView, sessionKey)
+        : removeSessionFromViewOp(fresh, _activeView, sessionKey);
+    })
+      .then(function(body) {
         if (_serverSettings) {
-          _serverSettings.views = patch.views;
-          if (patch.hidden_sessions) _serverSettings.hidden_sessions = patch.hidden_sessions;
+          _serverSettings.views = body.views;
+          if (body.hidden_sessions) _serverSettings.hidden_sessions = body.hidden_sessions;
         }
         // Update summary count in-place — do NOT re-render the full list (avoids layout thrash)
         var summaryEl = $('manage-view-summary');
@@ -3396,6 +3634,15 @@ async function selectWindow(sessionName, index, remoteId) {
 
 async function openSession(name, opts = {}) {
   if (!name || !name.trim()) return;
+  // A LOCAL switch (as opposed to adopting a value the server already told us
+  // about -- restoreState() on page load, or followRemoteActiveSession()
+  // echoing a remote switch, both of which pass isFollow:true). Mark this
+  // switch pending until its own server write settles (see the two places
+  // below that decrement), so a stale /api/state read that lands before then
+  // isn't mistaken for a genuine remote switch and doesn't yank the user back
+  // to the session they just switched away from.
+  var isLocal = !opts.isFollow;
+  if (isLocal) _pendingLocalSwitches++;
   hidePreview();
   _viewingSession = name;
   _viewingRemoteId = opts.remoteId != null ? opts.remoteId : '';
@@ -3475,12 +3722,19 @@ async function openSession(name, opts = {}) {
       await api('POST', '/api/sessions/' + encodeURIComponent(name) + '/connect');
     }
   } catch (err) {
+    if (isLocal) _pendingLocalSwitches--;
     showToast(err.message || 'Connection failed');
     return closeSession();
   }
 
-  // Persist active_remote_id so restoreState() can reopen remote sessions after page refresh
-  api('PATCH', '/api/state', { active_session: name, active_remote_id: _deviceId || null }).catch(function() {});
+  // Persist active_remote_id so restoreState() can reopen remote sessions after page refresh.
+  // Fire-and-forget for the caller (never awaited -- must not delay terminal mount below), but
+  // still tracked so a LOCAL switch's pending flag clears the moment the server confirms this
+  // write (success or failure), rather than lingering indefinitely.
+  var statePatch = api('PATCH', '/api/state', { active_session: name, active_remote_id: _deviceId || null }).catch(function() {});
+  if (isLocal) {
+    statePatch.then(function() { _pendingLocalSwitches--; });
+  }
 
   // Fire-and-forget bell-clear for remote sessions — acknowledge bells on the remote server
   if (_deviceId !== '') {
@@ -3545,6 +3799,22 @@ function _setViewingSession(name) {
   _viewingSession = name;
 }
 
+/**
+ * Test helper: set _viewingRemoteId directly.
+ * @param {string} remoteId
+ */
+function _setViewingRemoteId(remoteId) {
+  _viewingRemoteId = remoteId;
+}
+
+/**
+ * Test helper: set _pendingLocalSwitches directly (bypasses openSession's
+ * real increment/decrement so tests can exercise the guard deterministically).
+ */
+function _setPendingLocalSwitches(n) {
+  _pendingLocalSwitches = n;
+}
+
 // ─── Server settings ─────────────────────────────────────────────────────────
 
 /**
@@ -3564,6 +3834,140 @@ async function loadServerSettings() {
 }
 
 /**
+ * Re-render every view-dependent surface from current _serverSettings.
+ * Shared by followRemoteViewDefinitions() and the guarded-PATCH conflict
+ * path below -- both situations are "server truth changed out from under
+ * us, redraw everything that depends on view membership."
+ */
+function _rerenderViewDependentUI() {
+  renderViewDropdown();
+  renderGrid(_currentSessions || []);
+  renderSidebar(_currentSessions || [], _viewingSession, _viewingRemoteId);
+  if (_settingsOpen) renderViewsSettingsTab();
+  var manageViewPanel = $('manage-view-panel');
+  if (manageViewPanel && !manageViewPanel.classList.contains('hidden')) {
+    renderManageViewList();
+  }
+}
+
+/**
+ * PATCH /api/settings with optimistic-concurrency protection against the
+ * settings-clobber bug: a tab holding a STALE `_serverSettings` snapshot
+ * (e.g. an old copy of the entire `views` array) building a patch from
+ * that stale data and overwriting a concurrent edit from another
+ * device/tab. This is exactly how a real incident destroyed 7 of 8 views
+ * in one PATCH request.
+ *
+ * The server (as of the `expected_settings_updated_at` PATCH precondition)
+ * rejects the write with 409 when the caller's expectation is stale,
+ * making NO write -- see main.py's update_settings(). This helper is the
+ * one place that precondition is attached and the 409 retry is handled,
+ * so every call site gets the protection for free instead of re-deriving
+ * it per call site.
+ *
+ * ALSO re-fetches settings from the server IMMEDIATELY BEFORE building any
+ * patch that touches `views`/`hidden_sessions` -- never trusting a possibly
+ * long-lived `_serverSettings` cache as the baseline for a views mutation.
+ * This is the frontend half of closing the settings-clobber incident: the
+ * CAS precondition above stops a stale write from being ACCEPTED, but a page
+ * left open for hours would still keep BUILDING views patches from ancient
+ * data until it happened to 409 and recover. Detection is a cheap two-step:
+ * call `mutateFn` once against whatever baseline is on hand to see what it
+ * WOULD write; if that draft touches `views`/`hidden_sessions`, re-fetch and
+ * call `mutateFn` again against the fresh copy, discarding the draft. A
+ * patch that never touches those keys (e.g. a plain `fontSize` change) skips
+ * the extra round-trip entirely.
+ *
+ * A second, distinct failure mode gets different treatment: a 409 whose
+ * body has `backstop: true` (see main.py's update_settings()) means the
+ * write was rejected by the destructive-write backstop, not a stale
+ * baseline -- the intent itself (e.g. "replace views with this array")
+ * would catastrophically shrink view definitions. Retrying would just
+ * resend the same destructive payload, so this case never retries: it
+ * reloads server truth, re-renders, and logs a warning instead.
+ *
+ * @param {function(object): object} mutateFn - Given a deep copy of the
+ *   CURRENT `_serverSettings` (freshly re-fetched when the resulting patch
+ *   touches views/hidden_sessions; see above), returns the PATCH BODY to
+ *   send, e.g. `{ views: [...] }`. May be called up to three times: once to
+ *   detect intent, once (only if that intent touches views/hidden_sessions)
+ *   against a freshly re-fetched snapshot, and -- only on exactly one
+ *   stale-baseline 409 -- once more with an even-fresher snapshot.
+ * @param {object} [opts]
+ * @param {boolean} [opts.retry=true] - Internal: false on the retry attempt
+ *   itself, so a second consecutive 409 does not loop.
+ * @returns {Promise<object>} the parsed PATCH response body (redacted
+ *   settings, same shape GET /api/settings returns).
+ */
+async function patchSettingsGuarded(mutateFn, opts) {
+  var retry = !opts || opts.retry !== false;
+  // The retry attempt (opts.retry === false) already has a guaranteed-fresh
+  // baseline -- the 409 handler below just re-fetched it moments ago
+  // specifically so the retry could rebuild against server truth. Skip the
+  // detection re-fetch in that case; doing it anyway would just be a
+  // redundant extra round-trip against data that hasn't changed.
+  var isRetryAttempt = !!(opts && opts.retry === false);
+  var baseline = _serverSettings ? JSON.parse(JSON.stringify(_serverSettings)) : {};
+  var patch = mutateFn(baseline);
+
+  if (!isRetryAttempt &&
+      (Object.prototype.hasOwnProperty.call(patch, 'views') ||
+       Object.prototype.hasOwnProperty.call(patch, 'hidden_sessions'))) {
+    // This patch touches view membership/visibility -- never build it from
+    // a baseline that might be stale. Re-fetch and rebuild before sending.
+    await loadServerSettings();
+    _lastSettingsUpdatedAt = (_serverSettings && _serverSettings.settings_updated_at) || _lastSettingsUpdatedAt;
+    baseline = _serverSettings ? JSON.parse(JSON.stringify(_serverSettings)) : {};
+    patch = mutateFn(baseline);
+  }
+  patch.expected_settings_updated_at = _lastSettingsUpdatedAt;
+
+  try {
+    const res = await api('PATCH', '/api/settings', patch);
+    const responseBody = await res.json();
+    if (typeof responseBody.settings_updated_at === 'number') {
+      _lastSettingsUpdatedAt = responseBody.settings_updated_at;
+    }
+    return responseBody;
+  } catch (err) {
+    if (err.status === 409 && err.body && err.body.backstop === true) {
+      // Destructive-write backstop rejection: NOT a stale baseline -- the
+      // mutation itself would catastrophically shrink `views`. Retrying
+      // would just resend the same destructive payload, so reload from
+      // server truth and stop here instead of recursing.
+      await loadServerSettings();
+      _lastSettingsUpdatedAt = (_serverSettings && _serverSettings.settings_updated_at) || _lastSettingsUpdatedAt;
+      _rerenderViewDependentUI();
+      console.warn(
+        '[patchSettingsGuarded] destructive write rejected by server backstop:',
+        err.body.detail,
+      );
+      throw err;
+    }
+    if (err.status === 409 && retry) {
+      // Stale baseline: re-fetch server truth, re-apply the SAME intent to
+      // the FRESH copy, and retry exactly once (retry:false below means a
+      // second consecutive 409 falls to the else-branch, not another retry).
+      await loadServerSettings();
+      _lastSettingsUpdatedAt = (_serverSettings && _serverSettings.settings_updated_at) || _lastSettingsUpdatedAt;
+      return patchSettingsGuarded(mutateFn, { retry: false });
+    }
+    if (err.status === 409) {
+      // Second consecutive 409: don't loop. Re-render from server truth and
+      // surface a brief non-blocking notice (no dedicated toast text here --
+      // this is an edge case a normal user is unlikely to hit twice in a
+      // row -- console.warn is the existing fallback pattern used elsewhere
+      // in this file, e.g. loadServerSettings()'s own catch).
+      await loadServerSettings();
+      _lastSettingsUpdatedAt = (_serverSettings && _serverSettings.settings_updated_at) || _lastSettingsUpdatedAt;
+      _rerenderViewDependentUI();
+      console.warn('[patchSettingsGuarded] conflict persisted after retry; reloaded from server');
+    }
+    throw err;
+  }
+}
+
+/**
  * Send a PATCH to /api/settings with a single key/value update.
  * Shows a toast on success or failure.
  * @param {string} key
@@ -3572,7 +3976,7 @@ async function loadServerSettings() {
  */
 async function patchServerSetting(key, value) {
   try {
-    await api('PATCH', '/api/settings', { [key]: value });
+    await patchSettingsGuarded(function() { return { [key]: value }; });
     _serverSettings = Object.assign({}, _serverSettings, { [key]: value });
     showToast('Setting saved');
   } catch (err) {
@@ -3597,12 +4001,17 @@ function _buildRemoteInstanceRow(url, name, key) {
   urlInput.placeholder = 'http://192.168.1.x:8000';
   urlInput.value = url || '';
   urlInput.setAttribute('aria-label', 'Remote instance URL');
+  _suppressAutofill(urlInput);
   var nameInput = document.createElement('input');
   nameInput.type = 'text';
   nameInput.className = 'settings-remote-name';
   nameInput.placeholder = 'Device name';
   nameInput.value = name || '';
   nameInput.setAttribute('aria-label', 'Remote instance display name');
+  _suppressAutofill(nameInput);
+  // keyInput intentionally does NOT get _suppressAutofill: it's a real secret
+  // (type="password") a user may deliberately want their password manager to
+  // remember, unlike the name-ish fields above.
   var keyInput = document.createElement('input');
   keyInput.type = 'password';
   keyInput.className = 'settings-remote-key';
@@ -3839,7 +4248,7 @@ function onDisplaySettingChange() {
     activityIndicator: ds.activityIndicator,
   };
   Object.assign(_serverSettings, patch);
-  api('PATCH', '/api/settings', patch)
+  patchSettingsGuarded(function() { return patch; })
     .then(function() { showToast('Settings saved'); })
     .catch(function(err) { console.warn('[onDisplaySettingChange] failed:', err); });
   applyDisplaySettings(ds);
@@ -4189,9 +4598,65 @@ function updateSessionPill(sessions) {
 // ─── Header + button with inline name input ────────────────────────────────────
 
 /**
+ * Attribute/value pairs that suppress browser and password-manager autofill
+ * on a bare, form-less text input.
+ *
+ * `autocomplete="off"` alone is NOT enough. These fields are form-less text
+ * inputs with name-ish placeholders (a session name, a view name, a device
+ * name) served from an origin that also serves a real login form
+ * (login.html) — which is exactly the shape password managers heuristically
+ * treat as a username field, and they ignore `autocomplete="off"` on that
+ * shape by design. So we also send each vendor's documented per-field
+ * opt-out attribute. The autocorrect / autocapitalize pair additionally
+ * covers the mobile PWA path (e.g. the FAB new-session overlay), where iOS
+ * otherwise capitalizes and "corrects" names as you type them.
+ *
+ * This object is the single source of truth for the attribute list. The two
+ * static inputs in index.html (terminal search, device name) duplicate this
+ * list as literal HTML attributes ON PURPOSE — Chrome scans the DOM for
+ * autofill targets at parse time, before any of our JS runs, so attributes
+ * applied later via `_suppressAutofill` would be too late for those two
+ * fields. A test pins the markup copies in sync with this constant so they
+ * can't silently drift apart.
+ *
+ * Do NOT apply this to genuine credential fields — the federation key input
+ * in `_buildRemoteInstanceRow` and both inputs on login.html are the
+ * deliberate exceptions where a password manager is wanted.
+ *
+ * @type {Record<string, string>}
+ */
+const AUTOFILL_SUPPRESSION_ATTRS = {
+  autocomplete: 'off',
+  autocorrect: 'off',
+  autocapitalize: 'off',
+  'data-1p-ignore': 'true',   // 1Password
+  'data-lpignore': 'true',    // LastPass
+  'data-bwignore': 'true',    // Bitwarden
+  'data-form-type': 'other',  // Dashlane
+};
+
+/**
+ * Apply autofill suppression to a form-less text input by setting every
+ * attribute in AUTOFILL_SUPPRESSION_ATTRS plus disabling spellcheck (these
+ * fields hold names/URLs, not prose). See AUTOFILL_SUPPRESSION_ATTRS for why
+ * `autocomplete="off"` alone isn't sufficient.
+ *
+ * @param {HTMLInputElement} input
+ * @returns {HTMLInputElement} the same input, for chaining
+ */
+function _suppressAutofill(input) {
+  for (const attr of Object.keys(AUTOFILL_SUPPRESSION_ATTRS)) {
+    input.setAttribute(attr, AUTOFILL_SUPPRESSION_ATTRS[attr]);
+  }
+  input.spellcheck = false;
+  return input;
+}
+
+/**
  * Create a new session name input element with shared base configuration.
  * Used by both showNewSessionInput (inline) and showFabSessionInput (overlay)
- * to avoid duplicating the five setup properties.
+ * to avoid duplicating the setup properties.
+ *
  * @returns {HTMLInputElement}
  */
 function _createSessionInput() {
@@ -4199,9 +4664,7 @@ function _createSessionInput() {
   input.type = 'text';
   input.className = 'new-session-input';
   input.placeholder = 'Session name\u2026';
-  input.autocomplete = 'off';
-  input.spellcheck = false;
-  return input;
+  return _suppressAutofill(input);
 }
 
 /**
@@ -4388,14 +4851,23 @@ async function createNewSession(name, remoteId) {
         if (!remoteId && _localDeviceId) {
           newSessionKey = _localDeviceId + ':' + sessionName;
         }
-        var updatedViews = JSON.parse(JSON.stringify(views));
-        if (!updatedViews[viewIdx].sessions.includes(newSessionKey)) {
-          updatedViews[viewIdx].sessions.push(newSessionKey);
-          api('PATCH', '/api/settings', { views: updatedViews }).catch(function(err) {
+        patchSettingsGuarded(function(fresh) {
+          var freshViews = JSON.parse(JSON.stringify((fresh && fresh.views) || []));
+          var freshIdx = -1;
+          for (var fi = 0; fi < freshViews.length; fi++) {
+            if (freshViews[fi].name === _activeView) { freshIdx = fi; break; }
+          }
+          if (freshIdx >= 0 && !freshViews[freshIdx].sessions.includes(newSessionKey)) {
+            freshViews[freshIdx].sessions.push(newSessionKey);
+          }
+          return { views: freshViews };
+        })
+          .then(function(body) {
+            if (_serverSettings) _serverSettings.views = body.views;
+          })
+          .catch(function(err) {
             console.warn('[createNewSession] auto-add to view failed:', err);
           });
-          if (_serverSettings) _serverSettings.views = updatedViews;
-        }
       }
     }
 
@@ -4880,12 +5352,23 @@ document.addEventListener('DOMContentLoaded', async function() {
 
   // Load ALL settings (now includes display + sidebar) before first render
   await loadServerSettings();
+  // Seed the change-detection baseline so the first /api/state poll doesn't
+  // trigger a redundant re-fetch in followRemoteViewDefinitions().
+  _lastSettingsUpdatedAt = (_serverSettings && _serverSettings.settings_updated_at) || 0;
 
-  // Cache local device_id from /api/instance-info for session key construction
+  // Cache local device_id + version from /api/instance-info. device_id feeds
+  // session key construction; version populates the read-only Settings >
+  // Display "Version" field (reference info, not fetched again on dialog
+  // open — set directly on the element the moment this resolves).
   api('GET', '/api/instance-info').then(function(res) {
     return res.json();
   }).then(function(info) {
     if (info && info.device_id) _localDeviceId = info.device_id;
+    if (info && info.version) {
+      _localVersion = info.version;
+      var versionEl = $('setting-app-version');
+      if (versionEl) versionEl.textContent = 'v' + info.version;
+    }
   }).catch(function() { /* non-critical — local session key falls back to plain name */ });
 
   var _initDs = getDisplaySettings();
@@ -4903,6 +5386,7 @@ document.addEventListener('DOMContentLoaded', async function() {
   restoreState()
     .then(function() {
       startPolling();
+      startStatePolling();
       updatePageTitle();
       startHeartbeat();
       bindStaticEventListeners();
@@ -4917,7 +5401,7 @@ document.addEventListener('DOMContentLoaded', async function() {
     })
     .catch(function(err) {
       console.error('[init] restoreState failed, retrying in 5s:', err);
-      setTimeout(function() { startPolling(); }, POLL_MS);
+      setTimeout(function() { startPolling(); startStatePolling(); }, POLL_MS);
     });
 });
 
@@ -4933,8 +5417,14 @@ if (typeof module !== 'undefined' && module.exports) {
     buildHeartbeatPayload,
     setConnectionStatus,
     pollSessions,
+    followRemoteActiveSession,
+    followRemoteActiveView,
+    followRemoteViewDefinitions,
+    pollActiveState,
     startPolling,
+    startStatePolling,
     escapeHtml,
+    formatDeviceVersion,
     buildTileHTML,
     buildSidebarHTML,
     getVisibleSessions,
@@ -4954,6 +5444,8 @@ if (typeof module !== 'undefined' && module.exports) {
     openSession,
     closeSession,
     _setViewingSession,
+    _setViewingRemoteId,
+    _setPendingLocalSwitches,
     handleGlobalKeydown,
     bindStaticEventListeners,
     openBottomSheet,
@@ -4989,9 +5481,12 @@ if (typeof module !== 'undefined' && module.exports) {
     // Server settings
     loadServerSettings,
     patchServerSetting,
+    patchSettingsGuarded,
     // Fetch wrapper
     api,
     // Header + button with inline name input
+    AUTOFILL_SUPPRESSION_ATTRS,
+    _suppressAutofill,
     _createDeviceSelect,
     showNewSessionInput,
     showFabSessionInput,
@@ -5013,6 +5508,7 @@ if (typeof module !== 'undefined' && module.exports) {
     closeViewDropdown,
     showNewViewInput,
     switchView,
+    applyViewLocally,
     // Sidebar view dropdown
     renderSidebarViewDropdown,
     toggleSidebarViewDropdown,
