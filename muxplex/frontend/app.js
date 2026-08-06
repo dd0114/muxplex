@@ -224,6 +224,40 @@ let _gridViewMode = 'flat';
 let _activeFilterDevice = 'all';
 let _activeView = 'all';
 let _localDeviceId = null;
+
+/**
+ * URL domain filter — parse a session name out of location.pathname.
+ *
+ * The server serves the dashboard index at GET /<session_name> for any live
+ * tmux session (see main.py session_domain_page). The frontend reads the
+ * pathname at load time: "/sidekick" → show only the "sidekick" session in
+ * the sidebar, tiles, and session lists; "/" (or /index.html) → no filter,
+ * full dashboard (no regression).
+ *
+ * Returns the decoded session name, or null when the path carries no domain
+ * (root, index.html, login, or any multi-segment path).
+ *
+ * @param {string} pathname - location.pathname
+ * @returns {string|null}
+ */
+function parseDomainFilter(pathname) {
+  var p = (pathname || '').replace(/\/+$/, '');  // tolerate trailing slash
+  if (p === '' || p === '/index.html' || p === '/login') return null;
+  var segs = p.split('/').filter(function (s) { return s.length > 0; });
+  if (segs.length !== 1) return null;
+  try {
+    return decodeURIComponent(segs[0]);
+  } catch (e) {
+    return segs[0];
+  }
+}
+
+// Initialized once at load from the real browser location; null in the node
+// test environment (window.location stub has no pathname) and at "/".
+let _domainFilter =
+  (typeof window !== 'undefined' && window.location && window.location.pathname)
+    ? parseDomainFilter(window.location.pathname)
+    : null;
 const DISPLAY_DEFAULTS = {
   fontSize: 14,
   hoverPreviewDelay: 1500,
@@ -942,6 +976,15 @@ function visibleCount(sessions, settings, view, options) {
  * @returns {object[]}
  */
 function getVisibleSessions(sessions) {
+  if (_domainFilter) {
+    // URL domain view (/<session_name>): deterministic URL semantics beat
+    // saved view membership and hidden state — filter the *live* session list
+    // (includeHidden, view "all") down to the one named session. Status
+    // entries (unreachable/auth_failed devices) are still excluded by
+    // filterVisible's live-only pass.
+    var live = filterVisible(sessions, _serverSettings, 'all', { includeHidden: true });
+    return live.filter(function (s) { return s.name === _domainFilter; });
+  }
   return filterVisible(sessions, _serverSettings, _activeView);
 }
 
@@ -3228,7 +3271,9 @@ function updatePageTitle() {
     return s.bell && s.bell.unseen_count > 0;
   }).length;
   var prefix = count > 0 ? '(' + count + ') ' : '';
-  document.title = prefix + hostname + ' - muxplex';
+  // Domain view indicator: "/sidekick" shows as "sidekick @ host - muxplex".
+  var domain = _domainFilter ? _domainFilter + ' @ ' : '';
+  document.title = prefix + domain + hostname + ' - muxplex';
 }
 
 // ─── Session open / close ────────────────────────────────────────────────────
@@ -4735,6 +4780,12 @@ function _setActiveFilterDevice(device) {
 /** Test-only: get current _activeView value. */
 function _getActiveView() { return _activeView; }
 
+/** Test-only: set _domainFilter directly. */
+function _setDomainFilter(name) { _domainFilter = name; }
+
+/** Test-only: get current _domainFilter value. */
+function _getDomainFilter() { return _domainFilter; }
+
 /** Test-only: set _activeView directly. */
 function _setActiveView(view) { _activeView = view; }
 
@@ -4894,6 +4945,8 @@ if (typeof module !== 'undefined' && module.exports) {
     isHidden,
     filterVisible,
     visibleCount,
+    // URL domain filter (/<session_name>)
+    parseDomainFilter,
     // Operation layer (Phase 2) — pure data ops
     _opAddMembership,
     _opRemoveMembership,
@@ -4921,5 +4974,7 @@ if (typeof module !== 'undefined' && module.exports) {
     _setActiveFilterDevice,
     _getActiveView,
     _setActiveView,
+    _setDomainFilter,
+    _getDomainFilter,
   };
 }

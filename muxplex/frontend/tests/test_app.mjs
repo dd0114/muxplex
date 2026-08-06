@@ -5966,3 +5966,85 @@ test('renderWindowNode renders a group folder with wt-folder and nested windows 
   assert.ok(html.includes('onboard'), 'folder shows group name');
   assert.ok(html.includes('--wt-depth:1'), 'group members indent one level deeper');
 });
+
+// ─── URL domain filter (/<session_name>) ─────────────────────────────────────
+
+test('parseDomainFilter returns null for / and /index.html and /login', () => {
+  assert.strictEqual(app.parseDomainFilter('/'), null);
+  assert.strictEqual(app.parseDomainFilter(''), null);
+  assert.strictEqual(app.parseDomainFilter('/index.html'), null);
+  assert.strictEqual(app.parseDomainFilter('/login'), null);
+});
+
+test('parseDomainFilter extracts a single-segment session name', () => {
+  assert.strictEqual(app.parseDomainFilter('/sidekick'), 'sidekick');
+  assert.strictEqual(app.parseDomainFilter('/hmb'), 'hmb');
+  assert.strictEqual(app.parseDomainFilter('/sidekick/'), 'sidekick', 'trailing slash tolerated');
+});
+
+test('parseDomainFilter decodes percent-encoded names and rejects multi-segment paths', () => {
+  assert.strictEqual(app.parseDomainFilter('/my%20session'), 'my session');
+  assert.strictEqual(app.parseDomainFilter('/vendor/xterm.js'), null, 'multi-segment is not a domain');
+});
+
+test('getVisibleSessions with a domain filter returns only that session', () => {
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  app._setDomainFilter('sidekick');
+  const sessions = [
+    { name: 'sidekick', snapshot: '' },
+    { name: 'hmb', snapshot: '' },
+    { name: 'spider', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.strictEqual(result.length, 1, 'only the domain session survives the filter');
+  assert.strictEqual(result[0].name, 'sidekick');
+  app._setDomainFilter(null);
+});
+
+test('getVisibleSessions with domain filter overrides view membership and hidden state', () => {
+  // /sidekick must show sidekick even if the active view excludes it or it is hidden —
+  // deterministic URL semantics beat saved view state.
+  app._setServerSettings({
+    hidden_sessions: ['sidekick'],
+    views: [{ name: 'work', sessions: ['hmb'] }],
+  });
+  app._setActiveView('work');
+  app._setDomainFilter('sidekick');
+  const sessions = [
+    { name: 'sidekick', snapshot: '' },
+    { name: 'hmb', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.strictEqual(result.length, 1);
+  assert.strictEqual(result[0].name, 'sidekick');
+  app._setDomainFilter(null);
+  app._setServerSettings(null);
+  app._setActiveView('all');
+});
+
+test('getVisibleSessions without domain filter keeps full list (no regression at /)', () => {
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  app._setDomainFilter(null);
+  const sessions = [
+    { name: 'sidekick', snapshot: '' },
+    { name: 'hmb', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.strictEqual(result.length, 2, 'all sessions visible at /');
+});
+
+test('domain filter still excludes status entries (unreachable devices)', () => {
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  app._setDomainFilter('sidekick');
+  const sessions = [
+    { name: 'sidekick', snapshot: '' },
+    { status: 'unreachable', deviceName: 'gone-box' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.strictEqual(result.length, 1);
+  assert.strictEqual(result[0].name, 'sidekick');
+  app._setDomainFilter(null);
+});

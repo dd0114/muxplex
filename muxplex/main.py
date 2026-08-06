@@ -32,7 +32,7 @@ import websockets
 from websockets.typing import Subprotocol
 
 from fastapi import FastAPI, Form, HTTPException, Request, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 from starlette.responses import RedirectResponse
@@ -1732,6 +1732,49 @@ async def federation_delete_session(
             status_code=503,
             detail=f"Remote unreachable: {remote_url} ({type(exc).__name__}: {exc})",
         )
+
+
+# ---------------------------------------------------------------------------
+# Session-domain route — GET /<session_name>
+#
+# MUST be registered after every fixed route (first-match-wins) and BEFORE the
+# StaticFiles mount below: a Mount at "/" matches every remaining path, so a
+# route added after it would never fire.  Because this dynamic route therefore
+# also shadows *single-segment* static files (/app.js, /style.css, ...), the
+# handler explicitly falls through to the frontend dir first — real files
+# always win over session names.  Multi-segment paths (/vendor/xterm.js) never
+# match {session_name} and reach the StaticFiles mount unchanged.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/{session_name}", response_class=HTMLResponse)
+async def session_domain_page(session_name: str):
+    """Serve the dashboard index for a live tmux session name (domain view).
+
+    Opening /<session_name> where the name matches a live tmux session serves
+    the same index HTML as ``/`` — the frontend parses ``location.pathname``
+    and filters the sidebar/tiles to that one session (see app.js
+    parseDomainFilter).  Unknown names return 404.  Auth behaves exactly like
+    ``/`` because AuthMiddleware is path-generic (non-exempt, no static
+    extension → login redirect for unauthenticated remote clients).
+    """
+    # 1. Static-asset fallthrough: real frontend files always win.
+    candidate = (_FRONTEND_DIR / session_name).resolve()
+    try:
+        candidate.relative_to(_FRONTEND_DIR.resolve())
+    except ValueError:
+        # Traversal outside the frontend dir — never serve, never match.
+        raise HTTPException(status_code=404, detail="Not Found")
+    if candidate.is_file():
+        return FileResponse(candidate)
+
+    # 2. Live tmux session name → serve the (cache-busted) index.
+    if session_name in get_session_list():
+        return await index_page()
+
+    raise HTTPException(
+        status_code=404, detail=f"Session '{session_name}' not found"
+    )
 
 
 # ---------------------------------------------------------------------------
