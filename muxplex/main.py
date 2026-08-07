@@ -1280,6 +1280,34 @@ async def create_session(payload: CreateSessionPayload) -> dict:
     return {"name": name, "ok": True}
 
 
+# Serializes every ttyd kill+respawn pair (the /connect endpoint and the WS
+# proxy's auto-spawn). Without it, concurrent connects interleave freely: with
+# several muxplex clients open, one session switch fans out into a storm of
+# follow-up /connect POSTs (every fullscreen client re-connects on an
+# active_session change), and each request's kill_ttyd() can SIGKILL the ttyd
+# a concurrent request just spawned. When the last kill lands after the last
+# spawn, NO ttyd is left listening and the terminal never attaches — the
+# "session won't open" bug (observed live 2026-08-08: five interleaved
+# connects for 'sidekick' left port 7682 dead).
+_ttyd_respawn_lock = asyncio.Lock()
+
+
+async def _locked_ttyd_respawn(session_name: str) -> None:
+    """Kill+respawn ttyd for *session_name* under ``_ttyd_respawn_lock``.
+
+    Skips entirely when ttyd is already listening by the time the lock is
+    acquired — a concurrent /connect or another WS-proxy prep already finished
+    the respawn while this caller waited. Callers that must respawn even when
+    ttyd is listening (the /connect endpoint switching sessions) hold the lock
+    themselves and do their own stale-check instead.
+    """
+    async with _ttyd_respawn_lock:
+        if _ttyd_is_listening():
+            return
+        await kill_ttyd()
+        await spawn_ttyd(session_name)
+
+
 @app.post("/api/sessions/{name}/connect")
 async def connect_session(name: str) -> dict:
     """Connect to a tmux session via ttyd.
@@ -1316,13 +1344,29 @@ async def connect_session(name: str) -> dict:
         return {"active_session": name, "ttyd_port": TTYD_PORT}
 
     _log.info("Connecting to session '%s'", name)
-    await kill_ttyd()
-    await spawn_ttyd(name)
+    async with _ttyd_respawn_lock:
+        # Re-check under the lock: while this request queued, a concurrent
+        # /connect for the same session may have already finished the whole
+        # kill+respawn (multi-client follow storm — see _ttyd_respawn_lock).
+        # Killing again here would tear down the ttyd that request just
+        # spawned, which is exactly the bug the lock exists to prevent.
+        async with state_lock:
+            current = load_state().get("active_session")
+        if name == current and _ttyd_is_listening():
+            _log.info(
+                "Session '%s' respawned by a concurrent connect; skipping", name
+            )
+            return {"active_session": name, "ttyd_port": TTYD_PORT}
 
-    async with state_lock:
-        state = load_state()
-        state["active_session"] = name
-        save_state(state)
+        await kill_ttyd()
+        await spawn_ttyd(name)
+
+        # Persist inside the lock so queued same-session connects observe the
+        # new active_session in their re-check and short-circuit.
+        async with state_lock:
+            state = load_state()
+            state["active_session"] = name
+            save_state(state)
 
     return {"active_session": name, "ttyd_port": TTYD_PORT}
 
@@ -1990,8 +2034,13 @@ async def _prepare_ttyd_for_reconnect() -> None:
                 "WS proxy: ttyd not listening, auto-spawning for '%s'",
                 session_name,
             )
-            await kill_ttyd()
-            await spawn_ttyd(session_name)
+            # Locked: never interleave with a /connect's kill+respawn (see
+            # _ttyd_respawn_lock). Shielded: this prep task is raced against
+            # _client_disconnected() and cancelled if the browser goes away —
+            # a cancellation mid kill/spawn would otherwise strand ttyd dead
+            # for every OTHER connected client too. The shield lets the
+            # respawn run to completion; only the settle sleep is cancelled.
+            await asyncio.shield(_locked_ttyd_respawn(session_name))
             await asyncio.sleep(0.8)  # wait for ttyd to bind its port
     except Exception as exc:
         _log.warning("WS proxy: failed to auto-spawn ttyd: %s", exc)

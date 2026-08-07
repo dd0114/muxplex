@@ -1069,6 +1069,143 @@ def test_connect_different_session_respawns_even_if_ttyd_listening(client, monke
     assert load_state()["active_session"] == "beta"
 
 
+def test_concurrent_connects_collapse_to_one_respawn(monkeypatch):
+    """N concurrent /connect calls for the same session do ONE kill+respawn.
+
+    Regression for the multi-client follow storm (2026-08-08): every open
+    fullscreen client re-POSTs /connect when active_session changes, and the
+    unserialized kill_ttyd()+spawn_ttyd() pairs interleaved — a later
+    request's kill tearing down the ttyd an earlier request just spawned.
+    When the last kill landed after the last spawn, port 7682 was left dead
+    and the session never opened. Under _ttyd_respawn_lock the first request
+    respawns and every queued duplicate must short-circuit via its in-lock
+    re-check.
+    """
+    import asyncio
+
+    from muxplex import main as mainmod
+
+    events = []
+    listening = {"v": False}
+
+    async def mock_kill():
+        events.append("kill")
+        listening["v"] = False
+        await asyncio.sleep(0.01)  # force an interleaving window
+        return True
+
+    async def mock_spawn(name):
+        events.append(("spawn", name))
+        await asyncio.sleep(0.01)
+        listening["v"] = True
+
+    monkeypatch.setattr(mainmod, "get_session_list", lambda: ["alpha"])
+    monkeypatch.setattr(mainmod, "kill_ttyd", mock_kill)
+    monkeypatch.setattr(mainmod, "spawn_ttyd", mock_spawn)
+    monkeypatch.setattr(mainmod, "_ttyd_is_listening", lambda: listening["v"])
+    # Fresh locks — the module-level ones may be bound to another test's loop.
+    monkeypatch.setattr(mainmod, "_ttyd_respawn_lock", asyncio.Lock())
+    monkeypatch.setattr(mainmod, "state_lock", asyncio.Lock())
+
+    async def storm():
+        await asyncio.gather(
+            *[mainmod.connect_session("alpha") for _ in range(5)]
+        )
+
+    asyncio.run(storm())
+
+    assert events == ["kill", ("spawn", "alpha")], (
+        "expected exactly one serialized kill+respawn pair; interleaved or "
+        f"repeated pairs mean the storm race is back: {events}"
+    )
+    assert listening["v"], "ttyd must be left listening after the storm"
+
+
+def test_concurrent_connects_never_kill_after_final_spawn(monkeypatch):
+    """Even switching between DIFFERENT sessions concurrently, kill+spawn
+    pairs must never interleave — and no kill may land after the last spawn
+    (that is the exact interleaving that leaves no ttyd listening at all).
+    """
+    import asyncio
+
+    from muxplex import main as mainmod
+
+    events = []
+    listening = {"v": False}
+
+    async def mock_kill():
+        events.append("kill")
+        listening["v"] = False
+        await asyncio.sleep(0.01)
+        return True
+
+    async def mock_spawn(name):
+        events.append(("spawn", name))
+        await asyncio.sleep(0.01)
+        listening["v"] = True
+
+    monkeypatch.setattr(mainmod, "get_session_list", lambda: ["alpha", "beta"])
+    monkeypatch.setattr(mainmod, "kill_ttyd", mock_kill)
+    monkeypatch.setattr(mainmod, "spawn_ttyd", mock_spawn)
+    monkeypatch.setattr(mainmod, "_ttyd_is_listening", lambda: listening["v"])
+    monkeypatch.setattr(mainmod, "_ttyd_respawn_lock", asyncio.Lock())
+    monkeypatch.setattr(mainmod, "state_lock", asyncio.Lock())
+
+    async def storm():
+        await asyncio.gather(
+            mainmod.connect_session("alpha"),
+            mainmod.connect_session("beta"),
+            mainmod.connect_session("alpha"),
+            mainmod.connect_session("beta"),
+        )
+
+    asyncio.run(storm())
+
+    # Every kill is immediately followed by its own spawn (atomic pairs)...
+    for i, ev in enumerate(events):
+        if ev == "kill":
+            assert i + 1 < len(events) and events[i + 1][0] == "spawn", (
+                f"kill at index {i} not followed by its spawn: {events}"
+            )
+    # ...so the sequence can never end on a kill, and ttyd stays listening.
+    assert events[-1][0] == "spawn"
+    assert listening["v"], "a ttyd must be left listening after the storm"
+
+
+def test_ws_prep_respawn_skips_when_ttyd_already_listening(monkeypatch):
+    """_locked_ttyd_respawn must no-op when ttyd is already listening.
+
+    The WS proxy's auto-spawn queues behind /connect on _ttyd_respawn_lock;
+    by the time it acquires the lock a concurrent connect has usually already
+    respawned ttyd — killing it again would churn the PTY every client is
+    now attached to.
+    """
+    import asyncio
+
+    from muxplex import main as mainmod
+
+    events = []
+
+    async def mock_kill():
+        events.append("kill")
+        return True
+
+    async def mock_spawn(name):
+        events.append(("spawn", name))
+
+    monkeypatch.setattr(mainmod, "kill_ttyd", mock_kill)
+    monkeypatch.setattr(mainmod, "spawn_ttyd", mock_spawn)
+    monkeypatch.setattr(mainmod, "_ttyd_respawn_lock", asyncio.Lock())
+
+    monkeypatch.setattr(mainmod, "_ttyd_is_listening", lambda: True)
+    asyncio.run(mainmod._locked_ttyd_respawn("alpha"))
+    assert events == [], "listening ttyd must not be killed"
+
+    monkeypatch.setattr(mainmod, "_ttyd_is_listening", lambda: False)
+    asyncio.run(mainmod._locked_ttyd_respawn("alpha"))
+    assert events == ["kill", ("spawn", "alpha")]
+
+
 def test_connect_nonexistent_session_returns_404(client, monkeypatch):
     """POST /api/sessions/{name}/connect returns 404 when session is not in list."""
     monkeypatch.setattr("muxplex.main.get_session_list", lambda: ["alpha", "beta"])
