@@ -181,6 +181,15 @@ const FLYOUT_MENU_MAP = {
     { separator: true },
     { label: 'Kill Session', action: 'kill', className: 'flyout-menu__item--danger' },
   ],
+  // /my curation page: Hide must be the page-local (localStorage) hide. The
+  // server-side hide is invisible there \u2014 curation shows every live session
+  // regardless of hidden_sessions \u2014 so offering it would look like a no-op
+  // while silently hiding the session on the normal dashboard.
+  'curation': [
+    { label: 'Hide', action: 'curation-hide' },
+    { separator: true },
+    { label: 'Kill Session', action: 'kill', className: 'flyout-menu__item--danger' },
+  ],
 };
 
 /**
@@ -189,11 +198,12 @@ const FLYOUT_MENU_MAP = {
  * @returns {string} HTML for the menu items
  */
 function _buildFlyoutMenuItems() {
-  // Determine view type: 'all', 'hidden', or 'user'
+  // Determine view type: 'curation', 'all', 'hidden', or 'user'
   var viewType = _activeView;
   if (viewType !== 'all' && viewType !== 'hidden') {
     viewType = 'user';
   }
+  if (_curationMode) viewType = 'curation';
 
   var items = FLYOUT_MENU_MAP[viewType] || FLYOUT_MENU_MAP['all'];
   var html = '';
@@ -2731,6 +2741,7 @@ function closeFlyoutMenu() {
 function _openFlyoutSheet() {
   var viewType = _activeView;
   if (viewType !== 'all' && viewType !== 'hidden') viewType = 'user';
+  if (_curationMode) viewType = 'curation';
 
   var items = FLYOUT_MENU_MAP[viewType] || FLYOUT_MENU_MAP['all'];
 
@@ -2968,6 +2979,9 @@ function _handleFlyoutClick(e) {
     case 'hide':
       _doHideSession();
       break;
+    case 'curation-hide':
+      _doCurationHideFromFlyout();
+      break;
     case 'unhide':
       _doUnhideSession();
       break;
@@ -3128,6 +3142,20 @@ function _openFlyoutSubmenu(triggerItem, unhideFirst) {
         console.warn('[_openFlyoutSubmenu] PATCH failed:', err);
       });
   });
+}
+
+/**
+ * Curation-mode flyout Hide: page-local localStorage hide, no server PATCH.
+ * The tile's data-session-key uses the same sessionKey||name value the ×
+ * button and the curation filter use, so hide and filter always agree.
+ */
+function _doCurationHideFromFlyout() {
+  var sessionKey = _flyoutSessionKey;
+  if (!sessionKey) return;
+
+  closeFlyoutMenu();
+  curationHide(sessionKey);
+  _rerenderCuration();
 }
 
 /**
@@ -5554,6 +5582,9 @@ function _setCurationHiddenExpanded(value) { _curationHiddenExpanded = !!value; 
 /** Test-only: set _activeView directly. */
 function _setActiveView(view) { _activeView = view; }
 
+/** Test-only: set _flyoutSessionKey directly. */
+function _setFlyoutSessionKey(key) { _flyoutSessionKey = key; }
+
 // Recalculate fit layout on window resize
 window.addEventListener('resize', function() {
   var ds = getDisplaySettings();
@@ -5716,6 +5747,11 @@ if (typeof module !== 'undefined' && module.exports) {
     // Flyout menu
     openFlyoutMenu,
     closeFlyoutMenu,
+    FLYOUT_MENU_MAP,
+    _buildFlyoutMenuItems,
+    _handleFlyoutClick,
+    _doCurationHideFromFlyout,
+    _setFlyoutSessionKey,
     // Filter bar
     renderFilterBar,
     // View dropdown

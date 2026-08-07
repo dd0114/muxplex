@@ -7559,3 +7559,53 @@ test('buildCurationFooterHTML expanded lists restore buttons per hidden session'
   app._setCurationMode(false);
   localStorage.removeItem(app.CURATION_STORE_KEY);
 });
+
+// Regression (DONE4): on /my the flyout ⋮ menu offered the SERVER-side Hide,
+// which is invisible in curation mode (curation shows all live sessions), so
+// "Hide" looked like a no-op and silently polluted the normal dashboard's
+// hidden_sessions. Curation mode must swap the flyout to the page-local hide.
+
+test('flyout menu in curation mode offers curation-hide, never the server hide', () => {
+  app._setActiveView('all');
+  app._setCurationMode(false);
+  let html = app._buildFlyoutMenuItems();
+  assert.ok(html.includes('data-action="hide"'), 'normal dashboard keeps server hide');
+
+  app._setCurationMode(true);
+  html = app._buildFlyoutMenuItems();
+  assert.ok(html.includes('data-action="curation-hide"'), 'curation mode uses page-local hide');
+  assert.ok(!html.includes('data-action="hide"'), 'server hide must not appear on /my');
+  assert.ok(!html.includes('data-action="add-to-view"'), 'server views are meaningless on /my');
+  assert.ok(html.includes('data-action="kill"'), 'kill is still a real action on /my');
+  app._setCurationMode(false);
+});
+
+test('curation flyout map entry exists and mirrors the × button semantics', () => {
+  const items = app.FLYOUT_MENU_MAP['curation'];
+  assert.ok(Array.isArray(items), 'curation entry present (used by desktop flyout AND mobile sheet)');
+  const actions = items.filter((i) => !i.separator).map((i) => i.action);
+  assert.deepStrictEqual(actions, ['curation-hide', 'kill']);
+});
+
+test('_handleFlyoutClick curation-hide hides page-locally without any server call', () => {
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+  app._setCurationMode(true);
+  app._setFlyoutSessionKey('r1:spider');
+
+  let fetchCalls = 0;
+  globalThis.fetch = () => { fetchCalls += 1; return Promise.resolve({ ok: true, json: async () => ({}) }); };
+
+  app._handleFlyoutClick({ target: { closest: () => ({ dataset: { action: 'curation-hide' } }) } });
+
+  assert.strictEqual(app.isCurationHidden('r1:spider'), true, 'session hidden in localStorage');
+  assert.strictEqual(fetchCalls, 0, 'no PATCH — hide is page-local only');
+
+  // Without a session key the action is a no-op (menu opened on a stale tile).
+  app._setFlyoutSessionKey(null);
+  app._doCurationHideFromFlyout();
+  assert.deepStrictEqual(app.curationHiddenList(), ['r1:spider']);
+
+  globalThis.fetch = undefined;
+  app._setCurationMode(false);
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+});
