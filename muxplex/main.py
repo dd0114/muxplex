@@ -2812,6 +2812,21 @@ async def federation_delete_session(
         )
 
 
+@app.get("/test", response_class=HTMLResponse)
+async def multi_terminal_page():
+    """Serve the multi-terminal grid prototype (test.html).
+
+    Fixed route — must be registered before the /{session_name} catch-all
+    below, or "test" would be interpreted as a tmux session name and 404.
+    The page embeds the user-level ttyd (:7681) via ?arg= deep links and is
+    fully self-contained, so it only needs the same no-cache contract as the
+    other frontend entry points.
+    """
+    return FileResponse(
+        _FRONTEND_DIR / "test.html", headers={"Cache-Control": "no-cache"}
+    )
+
+
 # ---------------------------------------------------------------------------
 # Session-domain route — GET /<session_name>
 #

@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>multi-term — muxplex</title>
+<style>
+  :root {
+    --bar-h: 30px;
+    --bg: #0d1117;
+    --bar-bg: #161b22;
+    --border: #30363d;
+    --fg: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: var(--bg); color: var(--fg);
+    font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    overflow: hidden; }
+
+  /* --- slim control bar: single row, everything terminal below it --- */
+  #bar { height: var(--bar-h); display: flex; align-items: center; gap: 6px;
+    padding: 0 8px; background: var(--bar-bg);
+    border-bottom: 1px solid var(--border); overflow-x: auto; }
+  #bar .count { display: flex; align-items: center; gap: 2px; flex: none; }
+  #bar button { width: 22px; height: 22px; border: 1px solid var(--border);
+    border-radius: 4px; background: transparent; color: var(--fg);
+    font-size: 14px; line-height: 1; cursor: pointer; }
+  #bar button:hover { border-color: var(--accent); color: var(--accent); }
+  #bar button:disabled { opacity: .35; cursor: default; }
+  #bar .n { min-width: 16px; text-align: center; color: var(--muted);
+    font-variant-numeric: tabular-nums; }
+  #bar select { flex: 1 1 0; min-width: 60px; max-width: 260px; height: 22px;
+    border: 1px solid var(--border); border-radius: 4px;
+    background: var(--bg); color: var(--fg); font-size: 11px; }
+  #bar select.empty { color: var(--muted); }
+
+  /* --- terminal grid fills everything else --- */
+  #grid { height: calc(100% - var(--bar-h)); display: grid; gap: 1px;
+    background: var(--border); }
+  .pane { position: relative; background: var(--bg); min-width: 0; min-height: 0; }
+  .pane iframe { width: 100%; height: 100%; border: 0; display: block; }
+  .pane .placeholder { position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center; color: var(--muted);
+    font-size: 12px; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <span class="count">
+    <button id="dec" title="fewer panes">−</button>
+    <span class="n" id="n">3</span>
+    <button id="inc" title="more panes">+</button>
+  </span>
+</div>
+<div id="grid"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  const MIN = 1, MAX = 9, STORE_KEY = 'muxtest';
+  // The user-level ttyd on :7681 runs `ttyd --url-arg tmux attach -t`, so
+  // ?arg=<session>:<window_index> attaches straight to that window.
+  const TTYD = `http://${location.hostname}:7681/?arg=`;
+
+  const bar = document.getElementById('bar');
+  const grid = document.getElementById('grid');
+  const nEl = document.getElementById('n');
+
+  // options: [{target: "sess:idx", session, label}] from /api/windows
+  let options = [];
+  let state = load();
+
+  function load() {
+    try {
+      const s = JSON.parse(localStorage.getItem(STORE_KEY));
+      if (s && Number.isInteger(s.count)) {
+        return { count: Math.min(MAX, Math.max(MIN, s.count)),
+                 targets: Array.isArray(s.targets) ? s.targets : [] };
+      }
+    } catch { /* corrupted store falls through to defaults */ }
+    return { count: 3, targets: [] };
+  }
+  function save() { localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
+
+  function cols(n) { return n <= 3 ? n : Math.ceil(Math.sqrt(n)); }
+
+  async function fetchOptions() {
+    const res = await fetch('/api/windows');
+    const bySession = await res.json();
+    options = [];
+    for (const [session, wins] of Object.entries(bySession)) {
+      for (const w of wins) {
+        options.push({
+          target: `${session}:${w.index}`,
+          session,
+          active: !!w.active,
+          label: `${session}:${w.index} ${w.name || ''}`.trim(),
+        });
+      }
+    }
+  }
+
+  // Default assignment prefers one *distinct* session per pane (its active
+  // window): two tmux clients attached to the same session share the current
+  // window and would tug each other around.
+  function defaultTarget(paneIdx) {
+    const sessions = [...new Set(options.map(o => o.session))];
+    const session = sessions[paneIdx];
+    if (!session) return '';
+    const wins = options.filter(o => o.session === session);
+    return (wins.find(o => o.active) || wins[0]).target;
+  }
+
+  function paneSelect(i) {
+    const sel = document.createElement('select');
+    sel.title = `pane ${i + 1}`;
+    const blank = document.createElement('option');
+    blank.value = '';
+    blank.textContent = `pane ${i + 1} — select…`;
+    sel.appendChild(blank);
+    for (const o of options) {
+      const opt = document.createElement('option');
+      opt.value = o.target;
+      opt.textContent = o.label;
+      sel.appendChild(opt);
+    }
+    sel.value = state.targets[i] || '';
+    sel.classList.toggle('empty', !sel.value);
+    sel.addEventListener('change', () => {
+      state.targets[i] = sel.value;
+      sel.classList.toggle('empty', !sel.value);
+      save();
+      renderPane(i);
+    });
+    return sel;
+  }
+
+  function renderPane(i) {
+    const pane = grid.children[i];
+    if (!pane) return;
+    const target = state.targets[i];
+    const src = target ? TTYD + encodeURIComponent(target) : '';
+    let iframe = pane.querySelector('iframe');
+    const ph = pane.querySelector('.placeholder');
+    if (!src) {
+      if (iframe) iframe.remove();
+      ph.style.display = '';
+      return;
+    }
+    ph.style.display = 'none';
+    if (!iframe) {
+      iframe = document.createElement('iframe');
+      pane.appendChild(iframe);
+    }
+    // Only touch src on real change — resetting it reloads the terminal.
+    if (iframe.getAttribute('src') !== src) iframe.setAttribute('src', src);
+  }
+
+  function render() {
+    nEl.textContent = state.count;
+    document.getElementById('dec').disabled = state.count <= MIN;
+    document.getElementById('inc').disabled = state.count >= MAX;
+
+    // Rebuild the per-pane dropdowns in the bar.
+    for (const el of bar.querySelectorAll('select')) el.remove();
+    for (let i = 0; i < state.count; i++) bar.appendChild(paneSelect(i));
+
+    // Reuse existing pane DOM nodes so live terminals never reload on +/-.
+    while (grid.children.length > state.count) grid.lastChild.remove();
+    while (grid.children.length < state.count) {
+      const pane = document.createElement('div');
+      pane.className = 'pane';
+      const ph = document.createElement('div');
+      ph.className = 'placeholder';
+      ph.textContent = 'no window selected';
+      pane.appendChild(ph);
+      grid.appendChild(pane);
+    }
+    const c = cols(state.count);
+    grid.style.gridTemplateColumns = `repeat(${c}, 1fr)`;
+    grid.style.gridAutoRows = '1fr';
+    for (let i = 0; i < state.count; i++) renderPane(i);
+  }
+
+  function setCount(n) {
+    state.count = Math.min(MAX, Math.max(MIN, n));
+    for (let i = 0; i < state.count; i++) {
+      if (state.targets[i] === undefined) state.targets[i] = defaultTarget(i);
+    }
+    save();
+    render();
+  }
+
+  document.getElementById('dec').addEventListener('click', () => setCount(state.count - 1));
+  document.getElementById('inc').addEventListener('click', () => setCount(state.count + 1));
+
+  fetchOptions()
+    .catch(() => { options = []; })
+    .then(() => {
+      for (let i = 0; i < state.count; i++) {
+        if (!state.targets[i]) state.targets[i] = defaultTarget(i);
+      }
+      render();
+    });
+})();
+</script>
+</body>
+</html>
