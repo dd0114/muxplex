@@ -277,6 +277,19 @@ function parseDomainFilter(pathname) {
 // reachable from every domain view (/sidekick, /hmb, …). See #104.
 const HUB_SESSION_NAME = 'root';
 
+/**
+ * Whether a session belongs to a domain family: the domain session itself
+ * plus dash-suffixed siblings (/sidekick → sidekick, sidekick-infra,
+ * sidekick-foundation). Dash only — "sidekick2" is a different domain.
+ *
+ * @param {string} name - live session name
+ * @param {string} domain - current domain filter
+ * @returns {boolean}
+ */
+function inDomainFamily(name, domain) {
+  return name === domain || name.indexOf(domain + '-') === 0;
+}
+
 // Initialized once at load from the real browser location; null in the node
 // test environment (window.location stub has no pathname) and at "/".
 let _domainFilter =
@@ -390,7 +403,7 @@ function shouldRestoreSession(activeSession, domainFilter) {
   if (!activeSession) return false;
   if (
     domainFilter &&
-    activeSession !== domainFilter &&
+    !inDomainFamily(activeSession, domainFilter) &&
     activeSession !== HUB_SESSION_NAME
   ) {
     return false;
@@ -1265,11 +1278,15 @@ function getVisibleSessions(sessions) {
     //
     // The hub session (HUB_SESSION_NAME) is pinned into every domain view
     // (#104): the operator must always be able to reach the hub from
-    // /sidekick, /hmb, … Ordering is deterministic — domain session first,
-    // hub after it.
+    // /sidekick, /hmb, … The view covers the whole domain family
+    // (inDomainFamily): /sidekick also shows sidekick-infra,
+    // sidekick-foundation, … Ordering is deterministic — the domain session
+    // itself first, dash-suffixed siblings after it (list order), hub last.
     var live = filterVisible(sessions, _serverSettings, 'all', { includeHidden: true });
-    var domain = live.filter(function (s) { return s.name === _domainFilter; });
-    var hub = _domainFilter === HUB_SESSION_NAME
+    var family = live.filter(function (s) { return inDomainFamily(s.name, _domainFilter); });
+    var domain = family.filter(function (s) { return s.name === _domainFilter; })
+      .concat(family.filter(function (s) { return s.name !== _domainFilter; }));
+    var hub = inDomainFamily(HUB_SESSION_NAME, _domainFilter)
       ? []
       : live.filter(function (s) { return s.name === HUB_SESSION_NAME; });
     return domain.concat(hub);
@@ -5522,6 +5539,7 @@ if (typeof module !== 'undefined' && module.exports) {
     visibleCount,
     // URL domain filter (/<session_name>)
     parseDomainFilter,
+    inDomainFamily,
     shouldRestoreSession,
     // Operation layer (Phase 2) — pure data ops
     _opAddMembership,

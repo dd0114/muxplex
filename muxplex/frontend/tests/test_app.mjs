@@ -6424,6 +6424,38 @@ test('domain filter still excludes status entries (unreachable devices)', () => 
   app._setDomainFilter(null);
 });
 
+test('domain filter includes dash-suffixed family sessions, domain first, hub last', () => {
+  // /sidekick covers the whole domain family: sidekick-infra and
+  // sidekick-foundation ride along; sidekick2 is a different domain.
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  app._setDomainFilter('sidekick');
+  const sessions = [
+    { name: 'sidekick-infra', snapshot: '' },
+    { name: 'root', snapshot: '' },
+    { name: 'sidekick', snapshot: '' },
+    { name: 'sidekick2', snapshot: '' },
+    { name: 'hmb', snapshot: '' },
+    { name: 'sidekick-foundation', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions).map(function (s) { return s.name; });
+  assert.deepStrictEqual(result, ['sidekick', 'sidekick-infra', 'sidekick-foundation', 'root']);
+  app._setDomainFilter(null);
+});
+
+test('inDomainFamily matches only dash-suffixed siblings', () => {
+  assert.strictEqual(app.inDomainFamily('sidekick', 'sidekick'), true);
+  assert.strictEqual(app.inDomainFamily('sidekick-infra', 'sidekick'), true);
+  assert.strictEqual(app.inDomainFamily('sidekick2', 'sidekick'), false);
+  assert.strictEqual(app.inDomainFamily('side', 'sidekick'), false);
+});
+
+test('shouldRestoreSession allows family members at a domain view', () => {
+  assert.strictEqual(app.shouldRestoreSession('sidekick-infra', 'sidekick'), true);
+  assert.strictEqual(app.shouldRestoreSession('hmb', 'sidekick'), false);
+  assert.strictEqual(app.shouldRestoreSession('root', 'sidekick'), true);
+});
+
 test('getVisibleSessions pins the hub session into every domain view (#104)', () => {
   app._setServerSettings(null);
   app._setActiveView('all');
