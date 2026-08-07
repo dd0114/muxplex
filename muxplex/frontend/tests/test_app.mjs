@@ -7375,3 +7375,187 @@ test('a view-membership toggle through _saveViewsAndRerender produces the correc
 
   globalThis.fetch = undefined;
 });
+
+// ---------------------------------------------------------------------------
+// Curation page (/my) — manual localStorage hide/restore
+// ---------------------------------------------------------------------------
+
+test('parseCurationMode matches only /my', () => {
+  assert.strictEqual(app.parseCurationMode('/my'), true);
+  assert.strictEqual(app.parseCurationMode('/my/'), true, 'trailing slash tolerated');
+  assert.strictEqual(app.parseCurationMode('/'), false);
+  assert.strictEqual(app.parseCurationMode(''), false);
+  assert.strictEqual(app.parseCurationMode('/mysession'), false, 'prefix is not a match');
+  assert.strictEqual(app.parseCurationMode('/my/x'), false, 'multi-segment is not curation');
+  assert.strictEqual(app.parseCurationMode('/spider'), false);
+});
+
+test('curationHide/curationUnhide persist to localStorage and round-trip', () => {
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+  assert.deepStrictEqual(app.curationHiddenList(), [], 'empty store starts empty');
+
+  app.curationHide('spider');
+  app.curationHide('hmb');
+  app.curationHide('spider'); // duplicate is a no-op
+  assert.deepStrictEqual(app.curationHiddenList(), ['spider', 'hmb']);
+  assert.strictEqual(app.isCurationHidden('spider'), true);
+  assert.strictEqual(app.isCurationHidden('root'), false);
+  assert.strictEqual(
+    JSON.parse(localStorage.getItem(app.CURATION_STORE_KEY)).length, 2,
+    'hidden keys actually written to localStorage'
+  );
+
+  app.curationUnhide('spider');
+  assert.deepStrictEqual(app.curationHiddenList(), ['hmb']);
+  app.curationUnhide('never-hidden'); // no-op
+  assert.deepStrictEqual(app.curationHiddenList(), ['hmb']);
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+});
+
+test('curationHiddenList tolerates corrupt or non-array stores', () => {
+  localStorage.setItem(app.CURATION_STORE_KEY, '{not json');
+  assert.deepStrictEqual(app.curationHiddenList(), []);
+  localStorage.setItem(app.CURATION_STORE_KEY, '{"a":1}');
+  assert.deepStrictEqual(app.curationHiddenList(), []);
+  localStorage.setItem(app.CURATION_STORE_KEY, '["ok", 42, null, "fine"]');
+  assert.deepStrictEqual(app.curationHiddenList(), ['ok', 'fine'], 'non-strings dropped');
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+});
+
+test('getVisibleSessions in curation mode shows every live session minus local hides', () => {
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+  // Server settings hide spider and scope the active view to hmb only —
+  // curation mode must ignore BOTH and show everything live.
+  app._setServerSettings({
+    hidden_sessions: ['spider'],
+    views: [{ name: 'work', sessions: ['hmb'] }],
+  });
+  app._setActiveView('work');
+  app._setCurationMode(true);
+  const sessions = [
+    { name: 'spider', snapshot: '' },
+    { name: 'hmb', snapshot: '' },
+    { name: 'root', snapshot: '' },
+    { status: 'unreachable', deviceName: 'gone-box' },
+  ];
+  let result = app.getVisibleSessions(sessions).map((s) => s.name);
+  assert.deepStrictEqual(result, ['spider', 'hmb', 'root'],
+    'server-hidden spider visible, view membership ignored, status entries excluded');
+
+  app.curationHide('spider');
+  result = app.getVisibleSessions(sessions).map((s) => s.name);
+  assert.deepStrictEqual(result, ['hmb', 'root'], 'locally hidden session disappears');
+
+  app.curationUnhide('spider');
+  result = app.getVisibleSessions(sessions).map((s) => s.name);
+  assert.deepStrictEqual(result, ['spider', 'hmb', 'root'], 'restore brings it back');
+
+  app._setCurationMode(false);
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+});
+
+test('curation local hides do NOT leak into the normal dashboard filter', () => {
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+  app._setServerSettings(null);
+  app._setActiveView('all');
+  app._setCurationMode(false);
+  app.curationHide('spider');
+  const sessions = [
+    { name: 'spider', snapshot: '' },
+    { name: 'hmb', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions).map((s) => s.name);
+  assert.deepStrictEqual(result, ['spider', 'hmb'],
+    'at / the localStorage hide list is ignored');
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+});
+
+test('curation hides key by sessionKey when present', () => {
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+  app._setServerSettings(null);
+  app._setCurationMode(true);
+  app.curationHide('remote-1:spider');
+  const sessions = [
+    { name: 'spider', sessionKey: 'remote-1:spider', snapshot: '' },
+    { name: 'spider', snapshot: '' },
+  ];
+  const result = app.getVisibleSessions(sessions);
+  assert.strictEqual(result.length, 1, 'only the federated twin is hidden');
+  assert.strictEqual(result[0].sessionKey, undefined);
+  app._setCurationMode(false);
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+});
+
+test('buildCurationHideBtnHTML renders only in curation mode', () => {
+  app._setCurationMode(false);
+  assert.strictEqual(app.buildCurationHideBtnHTML({ name: 'spider' }), '');
+  app._setCurationMode(true);
+  const html = app.buildCurationHideBtnHTML({ name: 'spider' });
+  assert.ok(html.includes('curation-hide-btn'));
+  assert.ok(html.includes('data-session-key="spider"'));
+  const keyed = app.buildCurationHideBtnHTML({ name: 'spider', sessionKey: 'r1:spider' });
+  assert.ok(keyed.includes('data-session-key="r1:spider"'), 'sessionKey wins over name');
+  app._setCurationMode(false);
+});
+
+test('sidebar and tile HTML carry the hide toggle only on the curation page', () => {
+  app._setServerSettings(null);
+  const session = { name: 'spider', snapshot: '' };
+  app._setCurationMode(false);
+  assert.ok(!app.buildSidebarHTML(session, null, '').includes('curation-hide-btn'));
+  assert.ok(!app.buildTileHTML(session, 0, false).includes('curation-hide-btn'));
+  app._setCurationMode(true);
+  assert.ok(app.buildSidebarHTML(session, null, '').includes('curation-hide-btn'));
+  assert.ok(app.buildTileHTML(session, 0, false).includes('curation-hide-btn'));
+  app._setCurationMode(false);
+});
+
+test('buildCurationFooterHTML shows live hidden count and restore rows', () => {
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+  app._setServerSettings(null);
+  app._setCurationMode(false);
+  assert.strictEqual(app.buildCurationFooterHTML([]), '', 'nothing outside curation mode');
+
+  app._setCurationMode(true);
+  const sessions = [
+    { name: 'spider', snapshot: '' },
+    { name: 'hmb', snapshot: '' },
+  ];
+  let html = app.buildCurationFooterHTML(sessions);
+  assert.ok(html.includes('hidden 0'), 'footer always rendered, count 0');
+
+  app.curationHide('spider');
+  html = app.buildCurationFooterHTML(sessions);
+  assert.ok(html.includes('hidden 1'));
+  assert.ok(!html.includes('curation-restore-btn'), 'collapsed by default');
+
+  app._setCurationMode(false);
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+});
+
+test('buildCurationFooterHTML expanded lists restore buttons per hidden session', () => {
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+  app._setServerSettings(null);
+  app._setCurationMode(true);
+  app._setCurationHiddenExpanded(true);
+  const sessions = [
+    { name: 'spider', snapshot: '' },
+    { name: 'hmb', snapshot: '' },
+  ];
+  let html = app.buildCurationFooterHTML(sessions);
+  assert.ok(html.includes('nothing hidden'), 'expanded empty state');
+
+  app.curationHide('spider');
+  app.curationHide('hmb');
+  html = app.buildCurationFooterHTML(sessions);
+  assert.ok(html.includes('hidden 2'));
+  assert.ok(html.includes('curation-restore-btn'));
+  assert.ok(html.includes('data-session-key="spider"'));
+  assert.ok(html.includes('data-session-key="hmb"'));
+
+  app._setCurationHiddenExpanded(false);
+  app._setCurationMode(false);
+  localStorage.removeItem(app.CURATION_STORE_KEY);
+});

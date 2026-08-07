@@ -290,10 +290,85 @@ function inDomainFamily(name, domain) {
   return name === domain || name.indexOf(domain + '-') === 0;
 }
 
+// ---------------------------------------------------------------------------
+// Curation page (/my) — manual hide/restore, this page only.
+//
+// Unlike domain views (which filter automatically by URL) the curation page
+// shows EVERY live session — server hidden state and saved views are ignored
+// — and the operator hides sessions by hand with a per-session × toggle.
+// Hidden keys live in localStorage (CURATION_STORE_KEY), so they persist per
+// browser and never touch server settings: /, /spider, saved views are
+// unaffected by anything hidden here, and vice versa.
+// ---------------------------------------------------------------------------
+
+const CURATION_PATH = 'my';
+const CURATION_STORE_KEY = 'muxplexCurationHidden';
+
+/**
+ * Whether *pathname* is the curation page (/my, trailing slash tolerated).
+ * @param {string} pathname - location.pathname
+ * @returns {boolean}
+ */
+function parseCurationMode(pathname) {
+  var p = (pathname || '').replace(/\/+$/, '');
+  var segs = p.split('/').filter(function (s) { return s.length > 0; });
+  return segs.length === 1 && segs[0] === CURATION_PATH;
+}
+
+// Initialized once at load, before _domainFilter: /my is a fixed page, never
+// a domain view (the backend fixed route shadows any tmux session named "my").
+let _curationMode =
+  (typeof window !== 'undefined' && window.location && window.location.pathname)
+    ? parseCurationMode(window.location.pathname)
+    : false;
+
+// Whether the "hidden N" restore list is expanded. UI state only — not
+// persisted; every visit starts collapsed.
+let _curationHiddenExpanded = false;
+
+/** Hidden session keys from localStorage. Corrupt/missing store → []. */
+function curationHiddenList() {
+  try {
+    var arr = JSON.parse(localStorage.getItem(CURATION_STORE_KEY));
+    if (!Array.isArray(arr)) return [];
+    return arr.filter(function (k) { return typeof k === 'string'; });
+  } catch (e) {
+    return [];
+  }
+}
+
+function _curationSave(list) {
+  try {
+    localStorage.setItem(CURATION_STORE_KEY, JSON.stringify(list));
+  } catch (e) { /* storage full/unavailable — hide simply won't persist */ }
+}
+
+function isCurationHidden(key) {
+  return curationHiddenList().indexOf(key) !== -1;
+}
+
+function curationHide(key) {
+  if (!key) return;
+  var list = curationHiddenList();
+  if (list.indexOf(key) === -1) {
+    list.push(key);
+    _curationSave(list);
+  }
+}
+
+function curationUnhide(key) {
+  var list = curationHiddenList();
+  var i = list.indexOf(key);
+  if (i !== -1) {
+    list.splice(i, 1);
+    _curationSave(list);
+  }
+}
+
 // Initialized once at load from the real browser location; null in the node
 // test environment (window.location stub has no pathname) and at "/".
 let _domainFilter =
-  (typeof window !== 'undefined' && window.location && window.location.pathname)
+  (typeof window !== 'undefined' && window.location && window.location.pathname && !_curationMode)
     ? parseDomainFilter(window.location.pathname)
     : null;
 
@@ -839,6 +914,7 @@ function buildTileHTML(session, index, mobile) {
     `<span class="tile-name">${escapeHtml(name)}</span>` +
     `${badgeHtml}` +
     `<span class="tile-meta">${escapeHtml(timeStr)}</span>` +
+    buildCurationHideBtnHTML(session) +
     `<button class="tile-options-btn" data-session="${escapedName}" aria-label="Session options" aria-haspopup="true">&#8942;</button>` +
     `</div>` +
     `<div class="tile-body"><pre>${ansiToHtml(lastLines)}</pre></div>` +
@@ -1174,6 +1250,7 @@ function buildSidebarHTML(session, currentSession, currentRemoteId) {
     `<div class="sidebar-item-header">` +
     `<span class="sidebar-item-name">${escapedName}</span>` +
     badgeHtml +
+    buildCurationHideBtnHTML(session) +
     `<button class="tile-options-btn" data-session="${escapedName}" aria-label="Session options" aria-haspopup="true">&#8942;</button>` +
     `</div>` +
     `<div class="sidebar-item-body"><pre>${ansiToHtml(lastLines)}</pre></div>` +
@@ -1200,6 +1277,93 @@ function buildStatusTileHTML(deviceName, statusText, statusClass, deviceVersion)
     '<span class="source-tile__version">' + escapeHtml(formatDeviceVersion(deviceVersion)) + '</span>' +
     '</article>'
   );
+}
+
+// ---------------------------------------------------------------------------
+// Curation page UI (/my) — hide toggle, restore footer, rebinding.
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-session × hide toggle. Empty string outside curation mode, so the
+ * shared tile/sidebar builders stay untouched on /, domain views, and saved
+ * views.
+ * @param {object} session
+ * @returns {string}
+ */
+function buildCurationHideBtnHTML(session) {
+  if (!_curationMode) return '';
+  var key = session.sessionKey || session.name || '';
+  return (
+    '<button class="curation-hide-btn" data-session-key="' + escapeHtml(key) +
+    '" aria-label="Hide session on this page" title="Hide (this page only)">&times;</button>'
+  );
+}
+
+/**
+ * "hidden N" footer with the expandable restore list. Rendered in curation
+ * mode only, and ALWAYS rendered there — even at N=0 or when every session
+ * is hidden — so a hidden session can never become unreachable.
+ * @param {object[]} sessions - full raw session list (same input as render*)
+ * @returns {string}
+ */
+function buildCurationFooterHTML(sessions) {
+  if (!_curationMode) return '';
+  var live = filterVisible(sessions, _serverSettings, 'all', { includeHidden: true });
+  var hidden = live.filter(function (s) { return isCurationHidden(s.sessionKey || s.name); });
+  var html =
+    '<div class="curation-hidden">' +
+    '<button class="curation-hidden-toggle" aria-expanded="' + (_curationHiddenExpanded ? 'true' : 'false') + '">' +
+    (_curationHiddenExpanded ? '▾' : '▸') + ' hidden ' + hidden.length +
+    '</button>';
+  if (_curationHiddenExpanded) {
+    for (var i = 0; i < hidden.length; i++) {
+      var key = hidden[i].sessionKey || hidden[i].name;
+      html +=
+        '<button class="curation-restore-btn" data-session-key="' + escapeHtml(key) +
+        '" title="Restore session">↩ ' + escapeHtml(hidden[i].name || key) + '</button>';
+    }
+    if (hidden.length === 0) {
+      html += '<div class="curation-hidden-empty">nothing hidden</div>';
+    }
+  }
+  return html + '</div>';
+}
+
+/** Re-render both surfaces after a hide/restore/expand state change. */
+function _rerenderCuration() {
+  renderSidebar(_currentSessions || [], _viewingSession, _viewingRemoteId);
+  renderGrid(_currentSessions || []);
+}
+
+/**
+ * Bind curation controls (hide ×, "hidden N" toggle, restore rows) inside
+ * *container*. Called after the container's innerHTML is rebuilt, so the
+ * bindings are always fresh. No-op outside curation mode.
+ * @param {Element|null} container
+ */
+function bindCurationControls(container) {
+  if (!_curationMode || !container || typeof container.querySelectorAll !== 'function') return;
+  container.querySelectorAll('.curation-hide-btn').forEach(function (btn) {
+    on(btn, 'click', function (e) {
+      e.stopPropagation();
+      curationHide(btn.dataset.sessionKey);
+      _rerenderCuration();
+    });
+  });
+  container.querySelectorAll('.curation-hidden-toggle').forEach(function (btn) {
+    on(btn, 'click', function (e) {
+      e.stopPropagation();
+      _curationHiddenExpanded = !_curationHiddenExpanded;
+      _rerenderCuration();
+    });
+  });
+  container.querySelectorAll('.curation-restore-btn').forEach(function (btn) {
+    on(btn, 'click', function (e) {
+      e.stopPropagation();
+      curationUnhide(btn.dataset.sessionKey);
+      _rerenderCuration();
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1269,6 +1433,14 @@ function visibleCount(sessions, settings, view, options) {
  * @returns {object[]}
  */
 function getVisibleSessions(sessions) {
+  if (_curationMode) {
+    // Curation page (/my): every live session is in scope — server
+    // hidden_sessions and saved views are deliberately ignored (same
+    // includeHidden "all" pass the domain views use) — minus only the keys
+    // the operator hid by hand into localStorage.
+    var everyLive = filterVisible(sessions, _serverSettings, 'all', { includeHidden: true });
+    return everyLive.filter(function (s) { return !isCurationHidden(s.sessionKey || s.name); });
+  }
   if (_domainFilter) {
     // URL domain view (/<session_name>): deterministic URL semantics beat
     // saved view membership and hidden state — filter the *live* session list
@@ -1465,7 +1637,10 @@ function renderSidebar(sessions, currentSession, currentRemoteId) {
   const visible = getVisibleSessions(sessions);
 
   if (visible.length === 0) {
-    list.innerHTML = '<div class="sidebar-empty">No sessions</div>';
+    // Curation mode keeps the restore footer visible even when everything is
+    // hidden — otherwise a fully-curated-away list would be unrecoverable.
+    list.innerHTML = '<div class="sidebar-empty">No sessions</div>' + buildCurationFooterHTML(sessions);
+    bindCurationControls(list);
     return;
   }
 
@@ -1490,7 +1665,8 @@ function renderSidebar(sessions, currentSession, currentRemoteId) {
     html = visible.map((session) => buildSidebarHTML(session, currentSession, currentRemoteId)).join('');
   }
 
-  list.innerHTML = html;
+  list.innerHTML = html + buildCurationFooterHTML(sessions);
+  bindCurationControls(list);
 
   // Bind click handlers on each sidebar item, passing remoteId
   if (typeof list.querySelectorAll === 'function') {
@@ -1499,6 +1675,8 @@ function renderSidebar(sessions, currentSession, currentRemoteId) {
       const remoteId = item.dataset.remoteId || '';
       on(item, 'click', (e) => {
         if (e.target.closest && e.target.closest('.tile-options-btn')) return;
+        // Curation hide × has its own handler (bindCurationControls).
+        if (e.target.closest && e.target.closest('.curation-hide-btn')) return;
         // Window clicks are handled by their own handler below.
         if (e.target.closest && e.target.closest('.wt-window')) return;
         if (name !== currentSession || remoteId !== (currentRemoteId ?? '')) openSession(name, { remoteId });
@@ -2295,12 +2473,17 @@ function renderGrid(sessions) {
       else if (session.status === 'unreachable') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Offline', 'offline', session.deviceVersion);
     });
     if (grid) grid.innerHTML = statusTilesHtml;
-    // Only show empty-state when there are truly no tiles at all
+    // Only show empty-state when there are truly no tiles at all — except in
+    // curation mode, where the restore footer must stay reachable even with
+    // every session hidden.
     if (emptyState) {
       if (statusTilesHtml) emptyState.classList.add('hidden');
       else emptyState.classList.remove('hidden');
     }
-    if (filterBar) filterBar.innerHTML = '';
+    if (filterBar) {
+      filterBar.innerHTML = buildCurationFooterHTML(sessions);
+      bindCurationControls(filterBar);
+    }
     return;
   }
 
@@ -2344,15 +2527,22 @@ function renderGrid(sessions) {
     else if (session.status === 'unreachable') statusTilesHtml += buildStatusTileHTML(session.deviceName, 'Offline', 'offline', session.deviceVersion);
   });
   if (grid) grid.innerHTML = html + statusTilesHtml;
+  bindCurationControls(grid);
 
-  // Clear filter bar (filtered mode removed; bar is a no-op for flat/grouped)
-  if (filterBar) filterBar.innerHTML = '';
+  // Filter bar: no-op for flat/grouped; carries the curation restore footer
+  // on /my (empty string everywhere else).
+  if (filterBar) {
+    filterBar.innerHTML = buildCurationFooterHTML(sessions);
+    bindCurationControls(filterBar);
+  }
 
   // Bind interaction handlers on each tile
   document.querySelectorAll('.session-tile').forEach(function(tile) {
     on(tile, 'click', (e) => {
       // Don't navigate when clicking the options button inside the tile
       if (e.target.closest && e.target.closest('.tile-options-btn')) return;
+      // Curation hide × has its own handler (bindCurationControls).
+      if (e.target.closest && e.target.closest('.curation-hide-btn')) return;
       // Don't open error/status tiles (unreachable, auth_failed)
       if (tile.classList.contains('source-tile--error') || !tile.dataset.session) return;
       openSession(tile.dataset.session, { remoteId: tile.dataset.remoteId || '' });
@@ -5352,6 +5542,15 @@ function _setDomainFilter(name) { _domainFilter = name; }
 /** Test-only: get current _domainFilter value. */
 function _getDomainFilter() { return _domainFilter; }
 
+/** Test-only: set _curationMode directly. */
+function _setCurationMode(value) { _curationMode = !!value; }
+
+/** Test-only: get current _curationMode value. */
+function _getCurationMode() { return _curationMode; }
+
+/** Test-only: set _curationHiddenExpanded directly. */
+function _setCurationHiddenExpanded(value) { _curationHiddenExpanded = !!value; }
+
 /** Test-only: set _activeView directly. */
 function _setActiveView(view) { _activeView = view; }
 
@@ -5541,6 +5740,16 @@ if (typeof module !== 'undefined' && module.exports) {
     parseDomainFilter,
     inDomainFamily,
     shouldRestoreSession,
+    // Curation page (/my) — manual localStorage hide/restore
+    parseCurationMode,
+    curationHiddenList,
+    isCurationHidden,
+    curationHide,
+    curationUnhide,
+    buildCurationHideBtnHTML,
+    buildCurationFooterHTML,
+    bindCurationControls,
+    CURATION_STORE_KEY,
     // Operation layer (Phase 2) — pure data ops
     _opAddMembership,
     _opRemoveMembership,
@@ -5570,5 +5779,8 @@ if (typeof module !== 'undefined' && module.exports) {
     _setActiveView,
     _setDomainFilter,
     _getDomainFilter,
+    _setCurationMode,
+    _getCurationMode,
+    _setCurationHiddenExpanded,
   };
 }

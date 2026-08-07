@@ -2827,6 +2827,20 @@ async def multi_terminal_page():
     )
 
 
+@app.get("/my", response_class=HTMLResponse)
+async def curation_page():
+    """Serve the dashboard index for the manual-curation view (/my).
+
+    Same HTML as ``/`` — app.js parses ``location.pathname`` and enables
+    curation mode (parseCurationMode): every live session is shown with a
+    per-session hide toggle, hidden keys persist in localStorage only, and
+    server settings/views are untouched.  Fixed route — must be registered
+    before the /{session_name} catch-all below, or "my" would be interpreted
+    as a tmux session name and 404.
+    """
+    return await index_page()
+
+
 # ---------------------------------------------------------------------------
 # Session-domain route — GET /<session_name>
 #
