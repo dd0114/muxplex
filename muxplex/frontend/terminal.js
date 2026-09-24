@@ -34,9 +34,29 @@ function _encodePayload(typeChar, str) {
 // Ctrl+Shift+C: copy terminal selection to system clipboard
 // Ctrl+Shift+V: handled natively by xterm.js (browser paste event → xterm → WebSocket)
 
+// Copy feedback. With `set -g mouse on`, a drag is a tmux copy-mode selection
+// whose highlight disappears on release (copy-pipe-and-cancel), so without a
+// toast the user cannot tell whether the copy landed. showToast lives in app.js;
+// guarded so terminal.js still works standalone (node tests).
+function _notifyCopy(msg) {
+  if (typeof showToast === 'function') showToast(msg);
+}
+
 function _copyToClipboard(text) {
+  // Never write an empty string — an empty OSC 52 payload would otherwise
+  // wipe whatever the user copied last.
+  if (!text) return;
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).catch(function() {});
+    // Chrome only allows writeText with transient user activation, so an
+    // OSC 52 arriving without a recent gesture is rejected. Surface that
+    // instead of swallowing it — a silent failure is indistinguishable from
+    // "copy is broken".
+    navigator.clipboard.writeText(text).then(function() {
+      _notifyCopy('Copied ' + Array.from(text).length + ' chars');
+    }, function(err) {
+      console.warn('[clipboard] writeText rejected:', err && err.name, err && err.message);
+      _notifyCopy('Copy failed — clipboard access blocked');
+    });
   } else {
     // Fallback for non-HTTPS contexts (HTTP over LAN)
     var ta = document.createElement('textarea');
@@ -45,8 +65,10 @@ function _copyToClipboard(text) {
     ta.style.left = '-9999px';
     document.body.appendChild(ta);
     ta.select();
-    try { document.execCommand('copy'); } catch(e) {}
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch(e) {}
     document.body.removeChild(ta);
+    _notifyCopy(ok ? 'Copied ' + Array.from(text).length + ' chars' : 'Copy failed — clipboard access blocked');
   }
 }
 
@@ -252,6 +274,10 @@ function createTerminal(fontSize) {
     },
     scrollback: mobile ? 500 : 5000,
     allowProposedApi: true,
+    // macOS: Option+drag forces a native xterm.js selection even while tmux
+    // has mouse reporting on (`set -g mouse on`). Default false leaves no way
+    // to bypass tmux copy-mode on a Mac (Shift only forces it on other OSes).
+    macOptionClickForcesSelection: true,
   });
 
   _fitAddon = new window.FitAddon.FitAddon();

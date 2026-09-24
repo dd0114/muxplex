@@ -17,7 +17,7 @@ const require = createRequire(import.meta.url);
  * Load a fresh copy of terminal.js with isolated module-level state.
  * Returns { window } after the script has executed.
  */
-function loadTerminal() {
+function loadTerminal(opts = {}) {
   // Delete from require cache so each test gets fresh module-level state
   const modulePath = join(__dirname, '..', 'terminal.js');
   delete require.cache[require.resolve(modulePath)];
@@ -33,6 +33,8 @@ function loadTerminal() {
   let lastWsInstance = null;
   let capturedOscHandler = null;
   let clipboardWrites = [];
+  let toasts = [];
+  let capturedTermOptions = null;
 
   let capturedWsUrl = null;
   let onDataCallCount = 0;
@@ -103,7 +105,7 @@ function loadTerminal() {
     addEventListener: () => {},
     location: { href: '' },
     innerWidth: 1024,
-    Terminal: function Terminal() { return mockTerm; },
+    Terminal: function Terminal(options) { capturedTermOptions = options; return mockTerm; },
     FitAddon: {
       FitAddon: function FitAddon() { return { fit: () => {} }; },
     },
@@ -117,10 +119,17 @@ function loadTerminal() {
     configurable: true,
     value: {
       clipboard: {
-        writeText: (text) => { clipboardWrites.push(text); return Promise.resolve(); },
+        writeText: (text) => {
+          clipboardWrites.push(text);
+          return opts.rejectClipboard
+            ? Promise.reject(Object.assign(new Error('Write permission denied.'), { name: 'NotAllowedError' }))
+            : Promise.resolve();
+        },
       },
     },
   });
+  // app.js's showToast — terminal.js calls it (guarded) for copy feedback.
+  globalThis.showToast = (msg) => { toasts.push(msg); };
 
   require(modulePath);
 
@@ -159,6 +168,8 @@ function loadTerminal() {
     get termWriteMessages() { return termWriteMessages; },
     get focusCallCount() { return focusCallCount; },
     get clipboardWrites() { return clipboardWrites; },
+    get toasts() { return toasts; },
+    get capturedTermOptions() { return capturedTermOptions; },
     fireClose() { if (capturedCloseHandler) capturedCloseHandler(); },
     fireOpen() { if (lastOpenHandler) lastOpenHandler(); },
     fireOsc52(base64Payload) {
@@ -1231,3 +1242,51 @@ test('openTerminal uses passed fontSize to configure xterm.js Terminal construct
 });
 
 
+
+// --- Copy feedback / clobber guard (issue: drag-copy looked broken with tmux mouse on) ---
+
+function openForClipboardTest(opts) {
+  const t = loadTerminal(opts);
+  const orig = globalThis.setTimeout;
+  globalThis.setTimeout = (_fn, _ms) => 0;
+  t.openTerminal('test-session');
+  globalThis.setTimeout = orig;
+  return t;
+}
+
+test('OSC 52 copy shows a "Copied N chars" toast once writeText succeeds', async () => {
+  const t = openForClipboardTest();
+  t.fireOsc52(Buffer.from('두고 비교', 'utf-8').toString('base64'));
+  await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(t.clipboardWrites, ['두고 비교']);
+  assert.deepStrictEqual(t.toasts, ['Copied 5 chars'],
+    'toast must count characters (code points), not UTF-16 units or bytes');
+});
+
+test('rejected writeText is surfaced (toast + console.warn), not swallowed', async () => {
+  const t = openForClipboardTest({ rejectClipboard: true });
+  const warns = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => { warns.push(a.join(' ')); };
+  try {
+    t.fireOsc52(Buffer.from('hello', 'utf-8').toString('base64'));
+    await new Promise((r) => setImmediate(r));
+  } finally {
+    console.warn = origWarn;
+  }
+  assert.deepStrictEqual(t.toasts, ['Copy failed — clipboard access blocked']);
+  assert.ok(warns.some((w) => w.includes('NotAllowedError')), 'rejection reason must be logged');
+});
+
+test('empty OSC 52 payload never clears the clipboard', async () => {
+  const t = openForClipboardTest();
+  t.fireOsc52('');
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(t.clipboardWrites.length, 0, 'empty payload must not call writeText');
+  assert.strictEqual(t.toasts.length, 0);
+});
+
+test('Terminal is created with macOptionClickForcesSelection (Option+drag = native selection on macOS)', () => {
+  const t = openForClipboardTest();
+  assert.strictEqual(t.capturedTermOptions.macOptionClickForcesSelection, true);
+});
