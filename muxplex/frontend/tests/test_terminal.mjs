@@ -17,7 +17,7 @@ const require = createRequire(import.meta.url);
  * Load a fresh copy of terminal.js with isolated module-level state.
  * Returns { window } after the script has executed.
  */
-function loadTerminal() {
+function loadTerminal(opts = {}) {
   // Delete from require cache so each test gets fresh module-level state
   const modulePath = join(__dirname, '..', 'terminal.js');
   delete require.cache[require.resolve(modulePath)];
@@ -33,6 +33,19 @@ function loadTerminal() {
   let lastWsInstance = null;
   let capturedOscHandler = null;
   let clipboardWrites = [];
+  let toasts = [];
+  let capturedTermOptions = null;
+  let containerListeners = [];
+  let csiHandlers = [];
+  let capturedSelectionChange = null;
+  let capturedKeyHandler = null;
+  // Stable element, like the real DOM: openTerminal reuses it across sessions.
+  const containerEl = {
+    appendChild: () => {},
+    addEventListener: (ev, fn, opts) => {
+      containerListeners.push({ ev, fn, capture: opts === true || !!(opts && opts.capture) });
+    },
+  };
 
   let capturedWsUrl = null;
   let onDataCallCount = 0;
@@ -49,13 +62,14 @@ function loadTerminal() {
     dispose: () => {},
     write: (data) => { termWriteMessages.push(data); },
     focus: () => { focusCallCount++; },
-    attachCustomKeyEventHandler: () => {},
+    attachCustomKeyEventHandler: (fn) => { capturedKeyHandler = fn; },
     getSelection: () => '',
-    onSelectionChange: () => {},
+    onSelectionChange: (fn) => { capturedSelectionChange = fn; },
     parser: {
       registerOscHandler: (code, handler) => {
         if (code === 52) capturedOscHandler = handler;
       },
+      registerCsiHandler: (id, handler) => { csiHandlers.push({ id, handler }); },
     },
   };
 
@@ -90,7 +104,7 @@ function loadTerminal() {
   globalThis.location = { protocol: 'http:', host: 'localhost' };
   globalThis.document = {
     getElementById: (id) => {
-      if (id === 'terminal-container') return { appendChild: () => {}, addEventListener: () => {} };
+      if (id === 'terminal-container') return containerEl;
       if (id === 'reconnect-overlay') return { classList: { add: () => {}, remove: () => {} } };
       return null;
     },
@@ -103,7 +117,7 @@ function loadTerminal() {
     addEventListener: () => {},
     location: { href: '' },
     innerWidth: 1024,
-    Terminal: function Terminal() { return mockTerm; },
+    Terminal: function Terminal(options) { capturedTermOptions = options; return mockTerm; },
     FitAddon: {
       FitAddon: function FitAddon() { return { fit: () => {} }; },
     },
@@ -117,10 +131,17 @@ function loadTerminal() {
     configurable: true,
     value: {
       clipboard: {
-        writeText: (text) => { clipboardWrites.push(text); return Promise.resolve(); },
+        writeText: (text) => {
+          clipboardWrites.push(text);
+          return opts.rejectClipboard
+            ? Promise.reject(Object.assign(new Error('Write permission denied.'), { name: 'NotAllowedError' }))
+            : Promise.resolve();
+        },
       },
     },
   });
+  // app.js's showToast — terminal.js calls it (guarded) for copy feedback.
+  globalThis.showToast = (msg) => { toasts.push(msg); };
 
   require(modulePath);
 
@@ -159,6 +180,13 @@ function loadTerminal() {
     get termWriteMessages() { return termWriteMessages; },
     get focusCallCount() { return focusCallCount; },
     get clipboardWrites() { return clipboardWrites; },
+    get toasts() { return toasts; },
+    get capturedTermOptions() { return capturedTermOptions; },
+    get containerListeners() { return containerListeners; },
+    get csiHandlers() { return csiHandlers; },
+    get capturedKeyHandler() { return capturedKeyHandler; },
+    fireSelectionChange() { if (capturedSelectionChange) capturedSelectionChange(); },
+    mockTerm,
     fireClose() { if (capturedCloseHandler) capturedCloseHandler(); },
     fireOpen() { if (lastOpenHandler) lastOpenHandler(); },
     fireOsc52(base64Payload) {
@@ -362,7 +390,7 @@ function createMultiSessionEnv() {
       attachCustomKeyEventHandler: () => {},
       getSelection: () => '',
       onSelectionChange: () => {},
-      parser: { registerOscHandler: () => {} },
+      parser: { registerOscHandler: () => {}, registerCsiHandler: () => {} },
       writeMessages: [],
     };
     t.write = (data) => t.writeMessages.push(data);
@@ -962,11 +990,17 @@ test('_setTerminalFontSize sets _term.options.fontSize and calls _fitAddon.fit()
 
 // --- Clipboard Issue 1: auto-copy mouse selection via onSelectionChange ---
 
-test('terminal.js auto-copies mouse selection to clipboard via onSelectionChange', () => {
+test('terminal.js copies a selection on explicit copy (Cmd+C copy event), not on selection change', () => {
+  // Behavior-level coverage: see 'selecting text does not auto-copy' and
+  // 'Cmd+C copy event ... toast' below. Here: the copy listener is wired.
   const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
   assert.ok(
-    source.includes('onSelectionChange'),
-    'must register onSelectionChange handler to auto-copy mouse selection to clipboard',
+    source.includes("container.addEventListener('copy'"),
+    'must listen for the browser copy event (Cmd+C) on the terminal container',
+  );
+  assert.ok(
+    !source.includes('onSelectionChange'),
+    'selection must not auto-copy — drag selects, Cmd+C copies',
   );
 });
 
@@ -1173,7 +1207,7 @@ test('openTerminal uses passed fontSize to configure xterm.js Terminal construct
     attachCustomKeyEventHandler: () => {},
     getSelection: () => '',
     onSelectionChange: () => {},
-    parser: { registerOscHandler: () => {} },
+    parser: { registerOscHandler: () => {}, registerCsiHandler: () => {} },
     options: { fontSize: 14 },
   };
 
@@ -1231,3 +1265,175 @@ test('openTerminal uses passed fontSize to configure xterm.js Terminal construct
 });
 
 
+
+// --- Copy feedback / clobber guard (issue: drag-copy looked broken with tmux mouse on) ---
+
+function openForClipboardTest(opts) {
+  const t = loadTerminal(opts);
+  const orig = globalThis.setTimeout;
+  globalThis.setTimeout = (_fn, _ms) => 0;
+  t.openTerminal('test-session');
+  globalThis.setTimeout = orig;
+  return t;
+}
+
+test('OSC 52 copy shows a "Copied N chars" toast once writeText succeeds', async () => {
+  const t = openForClipboardTest();
+  t.fireOsc52(Buffer.from('두고 비교', 'utf-8').toString('base64'));
+  await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(t.clipboardWrites, ['두고 비교']);
+  assert.deepStrictEqual(t.toasts, ['Copied 5 chars'],
+    'toast must count characters (code points), not UTF-16 units or bytes');
+});
+
+test('rejected writeText is surfaced (toast + console.warn), not swallowed', async () => {
+  const t = openForClipboardTest({ rejectClipboard: true });
+  const warns = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => { warns.push(a.join(' ')); };
+  try {
+    t.fireOsc52(Buffer.from('hello', 'utf-8').toString('base64'));
+    await new Promise((r) => setImmediate(r));
+  } finally {
+    console.warn = origWarn;
+  }
+  assert.deepStrictEqual(t.toasts, ['Copy failed — clipboard access blocked']);
+  assert.ok(warns.some((w) => w.includes('NotAllowedError')), 'rejection reason must be logged');
+});
+
+test('empty OSC 52 payload never clears the clipboard', async () => {
+  const t = openForClipboardTest();
+  t.fireOsc52('');
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(t.clipboardWrites.length, 0, 'empty payload must not call writeText');
+  assert.strictEqual(t.toasts.length, 0);
+});
+
+// --- Native selection under tmux `mouse on` (drag highlight must survive release) ---
+
+function decset(t, final) {
+  return t.csiHandlers.find((h) => h.id.prefix === '?' && h.id.final === final).handler;
+}
+
+test('DECSET of mouse-tracking modes is swallowed so drags stay native xterm selections', () => {
+  const t = openForClipboardTest();
+  const set = decset(t, 'h');
+  assert.strictEqual(set([1000]), true, '?1000h must be swallowed');
+  assert.strictEqual(set([1002]), true, '?1002h (tmux button-event tracking) must be swallowed');
+  assert.strictEqual(set([1003]), true, '?1003h must be swallowed');
+  assert.strictEqual(set([1006]), false, 'SGR encoding (1006) is not tracking — let xterm apply it');
+  assert.strictEqual(set([25]), false, 'unrelated modes (cursor visibility) pass through');
+  assert.strictEqual(set([25, 1000]), false, 'mixed sequences fall through to xterm unchanged');
+});
+
+function wheelListener(t) {
+  const l = t.containerListeners.find((x) => x.ev === 'wheel');
+  assert.ok(l && l.capture, 'wheel listener must be capture-phase (before xterm turns it into arrow keys)');
+  return l.fn;
+}
+
+function fakeWheel(deltaY) {
+  const ev = { deltaY, deltaMode: 0, clientX: 15, clientY: 25, defaultPrevented: false, stopped: false };
+  ev.preventDefault = () => { ev.defaultPrevented = true; };
+  ev.stopPropagation = () => { ev.stopped = true; };
+  return ev;
+}
+
+function sentText(t) {
+  return t.sentMessages
+    .filter((m) => m instanceof Uint8Array && m[0] === 0x30)
+    .map((m) => Buffer.from(m.slice(1)).toString('utf-8'));
+}
+
+test('wheel is forwarded to tmux as SGR mouse reports while tmux wants mouse tracking', () => {
+  const t = openForClipboardTest();
+  decset(t, 'h')([1002]);
+  t.mockTerm.element = {
+    querySelector: () => ({ getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 480 }) }),
+  };
+  const onWheel = wheelListener(t);
+  const up = fakeWheel(-100);  // 2 notches at 50px each
+  onWheel(up);
+  assert.ok(up.defaultPrevented && up.stopped, 'xterm must not also handle the wheel');
+  onWheel(fakeWheel(50));
+  // cell under (15,25) with 80x24 over 800x480 → col 2, row 2
+  assert.deepStrictEqual(sentText(t).slice(-3), ['\x1b[<64;2;2M', '\x1b[<64;2;2M', '\x1b[<65;2;2M']);
+});
+
+test('wheel is left to xterm when no app asked for mouse tracking (or after ?1002l)', () => {
+  const t = openForClipboardTest();
+  const onWheel = wheelListener(t);
+  const before = sentText(t).length;
+  const ev = fakeWheel(-100);
+  onWheel(ev);
+  assert.strictEqual(ev.defaultPrevented, false);
+  decset(t, 'h')([1002]);
+  decset(t, 'l')([1002]);
+  onWheel(fakeWheel(-100));
+  assert.strictEqual(sentText(t).length, before, 'nothing forwarded without tracking');
+});
+
+test('container listeners are bound once across session switches', () => {
+  const t = openForClipboardTest();
+  const orig = globalThis.setTimeout;
+  globalThis.setTimeout = (_fn, _ms) => 0;
+  t.openTerminal('second-session');
+  globalThis.setTimeout = orig;
+  assert.strictEqual(t.containerListeners.filter((l) => l.ev === 'wheel').length, 1);
+});
+
+test('selecting text does not auto-copy (drag selects, Cmd+C copies)', async () => {
+  const t = openForClipboardTest();
+  t.mockTerm.getSelection = () => 'line38 alpha';
+  t.fireSelectionChange();
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(t.clipboardWrites.length, 0, 'selection alone must not touch the clipboard');
+});
+
+test('Cmd+C copy event with a selection shows the "Copied N chars" toast', () => {
+  const t = openForClipboardTest();
+  const onCopy = t.containerListeners.find((l) => l.ev === 'copy').fn;
+  t.mockTerm.hasSelection = () => true;
+  t.mockTerm.getSelection = () => '두고 비교';
+  onCopy({});
+  t.mockTerm.hasSelection = () => false;
+  onCopy({});
+  assert.deepStrictEqual(t.toasts, ['Copied 5 chars']);
+});
+
+// --- Keyboard contract for copy (Cmd+C / Ctrl+Shift+C) vs Ctrl+C (SIGINT) ---
+
+function keydown(props) {
+  return { type: 'keydown', ctrlKey: false, shiftKey: false, metaKey: false, altKey: false, ...props };
+}
+
+test('Ctrl+C is not intercepted — it still reaches the pane as ^C (SIGINT)', () => {
+  const t = openForClipboardTest();
+  t.mockTerm.getSelection = () => 'selected text';
+  assert.strictEqual(t.capturedKeyHandler(keydown({ ctrlKey: true, key: 'c', code: 'KeyC' })), true,
+    'xterm must process plain Ctrl+C even while text is selected');
+});
+
+test('Cmd+C is left to the browser so xterm.js serves the native copy event', () => {
+  const t = openForClipboardTest();
+  assert.strictEqual(t.capturedKeyHandler(keydown({ metaKey: true, key: 'c', code: 'KeyC' })), true);
+});
+
+test('Ctrl+Shift+C copies the selection explicitly (with toast) and is not sent to the pane', async () => {
+  const t = openForClipboardTest();
+  t.mockTerm.getSelection = () => 'selected text';
+  assert.strictEqual(t.capturedKeyHandler(keydown({ ctrlKey: true, shiftKey: true, key: 'C', code: 'KeyC' })), false);
+  await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(t.clipboardWrites, ['selected text']);
+  assert.deepStrictEqual(t.toasts, ['Copied 13 chars']);
+});
+
+test('mousedown is never intercepted — xterm.js focuses its textarea on the real mousedown', () => {
+  // Regression guard: an earlier attempt re-dispatched a synthetic mousedown
+  // (stopPropagation + modifier keys) to force selection, which skipped
+  // xterm's own focus() and broke keyboard input after a click. Native
+  // selection must come from the DECSET swallow, not from rewriting clicks.
+  const t = openForClipboardTest();
+  const intercepted = t.containerListeners.filter((l) => ['mousedown', 'mouseup', 'mousemove', 'click'].includes(l.ev));
+  assert.deepStrictEqual(intercepted, [], 'no mouse button listeners on the terminal container');
+});
