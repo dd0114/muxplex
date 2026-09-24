@@ -36,6 +36,15 @@ function loadTerminal(opts = {}) {
   let toasts = [];
   let capturedTermOptions = null;
   let containerListeners = [];
+  let csiHandlers = [];
+  let capturedSelectionChange = null;
+  // Stable element, like the real DOM: openTerminal reuses it across sessions.
+  const containerEl = {
+    appendChild: () => {},
+    addEventListener: (ev, fn, opts) => {
+      containerListeners.push({ ev, fn, capture: opts === true || !!(opts && opts.capture) });
+    },
+  };
 
   let capturedWsUrl = null;
   let onDataCallCount = 0;
@@ -54,11 +63,12 @@ function loadTerminal(opts = {}) {
     focus: () => { focusCallCount++; },
     attachCustomKeyEventHandler: () => {},
     getSelection: () => '',
-    onSelectionChange: () => {},
+    onSelectionChange: (fn) => { capturedSelectionChange = fn; },
     parser: {
       registerOscHandler: (code, handler) => {
         if (code === 52) capturedOscHandler = handler;
       },
+      registerCsiHandler: (id, handler) => { csiHandlers.push({ id, handler }); },
     },
   };
 
@@ -93,10 +103,7 @@ function loadTerminal(opts = {}) {
   globalThis.location = { protocol: 'http:', host: 'localhost' };
   globalThis.document = {
     getElementById: (id) => {
-      if (id === 'terminal-container') return {
-        appendChild: () => {},
-        addEventListener: (ev, fn, capture) => { containerListeners.push({ ev, fn, capture: !!capture }); },
-      };
+      if (id === 'terminal-container') return containerEl;
       if (id === 'reconnect-overlay') return { classList: { add: () => {}, remove: () => {} } };
       return null;
     },
@@ -175,6 +182,8 @@ function loadTerminal(opts = {}) {
     get toasts() { return toasts; },
     get capturedTermOptions() { return capturedTermOptions; },
     get containerListeners() { return containerListeners; },
+    get csiHandlers() { return csiHandlers; },
+    fireSelectionChange() { if (capturedSelectionChange) capturedSelectionChange(); },
     mockTerm,
     fireClose() { if (capturedCloseHandler) capturedCloseHandler(); },
     fireOpen() { if (lastOpenHandler) lastOpenHandler(); },
@@ -379,7 +388,7 @@ function createMultiSessionEnv() {
       attachCustomKeyEventHandler: () => {},
       getSelection: () => '',
       onSelectionChange: () => {},
-      parser: { registerOscHandler: () => {} },
+      parser: { registerOscHandler: () => {}, registerCsiHandler: () => {} },
       writeMessages: [],
     };
     t.write = (data) => t.writeMessages.push(data);
@@ -1190,7 +1199,7 @@ test('openTerminal uses passed fontSize to configure xterm.js Terminal construct
     attachCustomKeyEventHandler: () => {},
     getSelection: () => '',
     onSelectionChange: () => {},
-    parser: { registerOscHandler: () => {} },
+    parser: { registerOscHandler: () => {}, registerCsiHandler: () => {} },
     options: { fontSize: 14 },
   };
 
@@ -1297,30 +1306,87 @@ test('Terminal is created with macOptionClickForcesSelection (Option+drag = nati
   assert.strictEqual(t.capturedTermOptions.macOptionClickForcesSelection, true);
 });
 
-test('forced selection under mouse tracking is copied on mouseup (capture phase, before xterm clears it)', async () => {
-  const t = openForClipboardTest();
-  const mouseups = t.containerListeners.filter((l) => l.ev === 'mouseup' && l.capture);
-  assert.strictEqual(mouseups.length, 1, 'must register exactly one capture-phase mouseup listener');
+// --- Native selection under tmux `mouse on` (drag highlight must survive release) ---
 
-  // tmux `mouse on` → xterm mouse tracking active, Option+drag left a selection
-  t.mockTerm.modes = { mouseTrackingMode: 'drag' };
-  t.mockTerm.hasSelection = () => true;
-  t.mockTerm.getSelection = () => 'line38 alpha';
-  mouseups[0].fn({});
-  await new Promise((r) => setImmediate(r));
-  assert.deepStrictEqual(t.clipboardWrites, ['line38 alpha']);
+function decset(t, final) {
+  return t.csiHandlers.find((h) => h.id.prefix === '?' && h.id.final === final).handler;
+}
+
+test('DECSET of mouse-tracking modes is swallowed so drags stay native xterm selections', () => {
+  const t = openForClipboardTest();
+  const set = decset(t, 'h');
+  assert.strictEqual(set([1000]), true, '?1000h must be swallowed');
+  assert.strictEqual(set([1002]), true, '?1002h (tmux button-event tracking) must be swallowed');
+  assert.strictEqual(set([1003]), true, '?1003h must be swallowed');
+  assert.strictEqual(set([1006]), false, 'SGR encoding (1006) is not tracking — let xterm apply it');
+  assert.strictEqual(set([25]), false, 'unrelated modes (cursor visibility) pass through');
+  assert.strictEqual(set([25, 1000]), false, 'mixed sequences fall through to xterm unchanged');
 });
 
-test('mouseup copy is a no-op without mouse tracking (onSelectionChange already covers it)', async () => {
+function wheelListener(t) {
+  const l = t.containerListeners.find((x) => x.ev === 'wheel');
+  assert.ok(l && l.capture, 'wheel listener must be capture-phase (before xterm turns it into arrow keys)');
+  return l.fn;
+}
+
+function fakeWheel(deltaY) {
+  const ev = { deltaY, deltaMode: 0, clientX: 15, clientY: 25, defaultPrevented: false, stopped: false };
+  ev.preventDefault = () => { ev.defaultPrevented = true; };
+  ev.stopPropagation = () => { ev.stopped = true; };
+  return ev;
+}
+
+function sentText(t) {
+  return t.sentMessages
+    .filter((m) => m instanceof Uint8Array && m[0] === 0x30)
+    .map((m) => Buffer.from(m.slice(1)).toString('utf-8'));
+}
+
+test('wheel is forwarded to tmux as SGR mouse reports while tmux wants mouse tracking', () => {
   const t = openForClipboardTest();
-  const mouseup = t.containerListeners.find((l) => l.ev === 'mouseup' && l.capture);
-  t.mockTerm.modes = { mouseTrackingMode: 'none' };
-  t.mockTerm.hasSelection = () => true;
-  t.mockTerm.getSelection = () => 'x';
-  mouseup.fn({});
-  t.mockTerm.modes = { mouseTrackingMode: 'drag' };
-  t.mockTerm.hasSelection = () => false;
-  mouseup.fn({});
+  decset(t, 'h')([1002]);
+  t.mockTerm.element = {
+    querySelector: () => ({ getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 480 }) }),
+  };
+  const onWheel = wheelListener(t);
+  const up = fakeWheel(-100);  // 2 notches at 50px each
+  onWheel(up);
+  assert.ok(up.defaultPrevented && up.stopped, 'xterm must not also handle the wheel');
+  onWheel(fakeWheel(50));
+  // cell under (15,25) with 80x24 over 800x480 → col 2, row 2
+  assert.deepStrictEqual(sentText(t).slice(-3), ['\x1b[<64;2;2M', '\x1b[<64;2;2M', '\x1b[<65;2;2M']);
+});
+
+test('wheel is left to xterm when no app asked for mouse tracking (or after ?1002l)', () => {
+  const t = openForClipboardTest();
+  const onWheel = wheelListener(t);
+  const before = sentText(t).length;
+  const ev = fakeWheel(-100);
+  onWheel(ev);
+  assert.strictEqual(ev.defaultPrevented, false);
+  decset(t, 'h')([1002]);
+  decset(t, 'l')([1002]);
+  onWheel(fakeWheel(-100));
+  assert.strictEqual(sentText(t).length, before, 'nothing forwarded without tracking');
+});
+
+test('container listeners are bound once across session switches', () => {
+  const t = openForClipboardTest();
+  const orig = globalThis.setTimeout;
+  globalThis.setTimeout = (_fn, _ms) => 0;
+  t.openTerminal('second-session');
+  globalThis.setTimeout = orig;
+  assert.strictEqual(t.containerListeners.filter((l) => l.ev === 'wheel').length, 1);
+});
+
+test('auto-copy skips jitter selections (<2 non-space chars) so a click cannot clobber the clipboard', async () => {
+  const t = openForClipboardTest();
+  for (const sel of ['─', 'a ', '   ', 'e']) {
+    t.mockTerm.getSelection = () => sel;
+    t.fireSelectionChange();
+  }
+  t.mockTerm.getSelection = () => 'ls';
+  t.fireSelectionChange();
   await new Promise((r) => setImmediate(r));
-  assert.strictEqual(t.clipboardWrites.length, 0);
+  assert.deepStrictEqual(t.clipboardWrites, ['ls']);
 });

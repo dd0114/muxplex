@@ -72,6 +72,91 @@ function _copyToClipboard(text) {
   }
 }
 
+// ─── Native selection under tmux `mouse on` ──────────────────────────────────
+// tmux `mouse on` asks the terminal for mouse tracking (DECSET 1000/1002/1003).
+// If xterm.js honors it, every drag becomes a tmux copy-mode selection that is
+// cancelled on release (copy-*-and-cancel) — the highlight vanishes the moment
+// the button comes up, and keeping it (copy-pipe-no-clear) leaves the pane in
+// copy-mode so typing stops reaching the app. Instead we swallow the tracking
+// request: drags stay native xterm.js selections (highlight persists, copied by
+// the onSelectionChange auto-copy), and only the wheel is forwarded to the app
+// as SGR mouse reports, so tmux's WheelUpPane/copy-mode scrolling keeps working.
+// Trade-off: plain clicks no longer reach tmux (pane/status-bar clicks, tmux's
+// right-click menu, mouse input for TUIs inside the pane).
+var _MOUSE_TRACKING_MODES = [9, 1000, 1001, 1002, 1003];
+var _WHEEL_STEP_PX = 50;      // accumulated pixel delta per forwarded wheel notch
+var _appMouseTracking = false; // app asked for tracking we did not hand to xterm
+var _wheelAccum = 0;
+
+function _decsetModes(params) {
+  var modes = [];
+  for (var i = 0; i < params.length; i++) {
+    modes.push(Array.isArray(params[i]) ? params[i][0] : params[i]);
+  }
+  return modes;
+}
+
+function _isTrackingMode(m) {
+  return _MOUSE_TRACKING_MODES.indexOf(m) !== -1;
+}
+
+// Forward one wheel notch to the app as an SGR mouse report (button 64 = up,
+// 65 = down) at the cell under the pointer.
+function _sendWheelReport(e, dir) {
+  if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
+  var col = 1, row = 1;
+  var screen = _term.element && _term.element.querySelector('.xterm-screen');
+  if (screen && e.clientX !== undefined) {
+    var rect = screen.getBoundingClientRect();
+    if (rect.width > 0 && rect.height > 0) {
+      col = Math.floor((e.clientX - rect.left) / (rect.width / _term.cols)) + 1;
+      row = Math.floor((e.clientY - rect.top) / (rect.height / _term.rows)) + 1;
+    }
+  }
+  col = Math.min(Math.max(col, 1), _term.cols);
+  row = Math.min(Math.max(row, 1), _term.rows);
+  _ws.send(_encodePayload(0x30, '\x1b[<' + (dir < 0 ? 64 : 65) + ';' + col + ';' + row + 'M'));
+}
+
+function _installNativeSelection(term, container) {
+  _appMouseTracking = false;
+  _wheelAccum = 0;
+
+  // Swallow DECSET of tracking modes (tmux sends each mode as its own
+  // sequence). A mixed sequence falls through to xterm unchanged.
+  term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, function(params) {
+    var modes = _decsetModes(params);
+    var tracking = modes.filter(_isTrackingMode);
+    if (!tracking.length) return false;
+    _appMouseTracking = true;
+    return tracking.length === modes.length;
+  });
+  term.parser.registerCsiHandler({ prefix: '?', final: 'l' }, function(params) {
+    if (_decsetModes(params).some(_isTrackingMode)) _appMouseTracking = false;
+    return false;
+  });
+
+  // Container listeners are bound once — openTerminal reuses the container
+  // for every session, and they read the module-level _term/_ws.
+  if (container._muxplexNativeSelection) return;
+  container._muxplexNativeSelection = true;
+
+  // Capture phase: runs before xterm's own wheel handler (which, with no
+  // tracking on the alternate screen, would turn the wheel into arrow keys).
+  container.addEventListener('wheel', function(e) {
+    if (!_term || !_appMouseTracking) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var px = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1);
+    _wheelAccum += px;
+    while (Math.abs(_wheelAccum) >= _WHEEL_STEP_PX) {
+      var dir = _wheelAccum < 0 ? -1 : 1;
+      _sendWheelReport(e, dir);
+      _wheelAccum -= dir * _WHEEL_STEP_PX;
+    }
+  }, { capture: true, passive: false });
+}
+
 // ─── Forward declarations ─────────────────────────────────────────────────────
 
 function connectWebSocket(name, remoteId) {
@@ -428,24 +513,18 @@ function openTerminal(sessionName, remoteId, fontSize) {
   // Matches terminal emulator conventions (iTerm2, WezTerm, ttyd native).
   // onSelectionChange fires whenever selection changes — copy if text is selected.
   // When selection is cleared (empty string), we skip the clipboard write.
+  // Selections under 2 non-space chars are skipped: a click whose pointer
+  // jitters across a cell boundary (e.g. clicking the input line before Cmd+V)
+  // selects a stray "─" or blank and would overwrite what was just copied.
+  // Ctrl+Shift+C still copies any selection explicitly.
   _term.onSelectionChange(function() {
     var sel = _term.getSelection();
-    if (sel) {
+    if (sel && sel.trim().length >= 2) {
       _copyToClipboard(sel);
     }
   });
 
-  // Forced selection (Option+drag on macOS, Shift+drag elsewhere) while the
-  // app has mouse tracking on (tmux `mouse on`): xterm.js still reports the
-  // mouseup to the app, and that reported input clears the selection before
-  // the user can copy it. Capture phase on the container runs before xterm's
-  // own listeners, so the selection is still intact here — copy it now.
-  container.addEventListener('mouseup', function() {
-    if (!_term || !_term.modes || _term.modes.mouseTrackingMode === 'none') return;
-    if (!_term.hasSelection()) return;
-    var sel = _term.getSelection();
-    if (sel) _copyToClipboard(sel);
-  }, true);
+  _installNativeSelection(_term, container);
 
   // OSC 52 clipboard integration — bridges tmux clipboard to the browser.
   // When tmux copies text (with `set-clipboard on` in .tmux.conf), it sends
