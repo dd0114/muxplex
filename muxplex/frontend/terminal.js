@@ -34,10 +34,10 @@ function _encodePayload(typeChar, str) {
 // Ctrl+Shift+C: copy terminal selection to system clipboard
 // Ctrl+Shift+V: handled natively by xterm.js (browser paste event → xterm → WebSocket)
 
-// Copy feedback. With `set -g mouse on`, a drag is a tmux copy-mode selection
-// whose highlight disappears on release (copy-pipe-and-cancel), so without a
-// toast the user cannot tell whether the copy landed. showToast lives in app.js;
-// guarded so terminal.js still works standalone (node tests).
+// Copy feedback ("Copied N chars" / failure) for every copy path — Cmd+C,
+// Ctrl+Shift+C and OSC 52 from tmux — so a copy never succeeds or fails
+// silently. showToast lives in app.js; guarded so terminal.js still works
+// standalone (node tests).
 function _notifyCopy(msg) {
   if (typeof showToast === 'function') showToast(msg);
 }
@@ -367,10 +367,6 @@ function createTerminal(fontSize) {
     },
     scrollback: mobile ? 500 : 5000,
     allowProposedApi: true,
-    // macOS: Option+drag forces a native xterm.js selection even while tmux
-    // has mouse reporting on (`set -g mouse on`). Default false leaves no way
-    // to bypass tmux copy-mode on a Mac (Shift only forces it on other OSes).
-    macOptionClickForcesSelection: true,
   });
 
   _fitAddon = new window.FitAddon.FitAddon();

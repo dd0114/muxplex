@@ -38,6 +38,7 @@ function loadTerminal(opts = {}) {
   let containerListeners = [];
   let csiHandlers = [];
   let capturedSelectionChange = null;
+  let capturedKeyHandler = null;
   // Stable element, like the real DOM: openTerminal reuses it across sessions.
   const containerEl = {
     appendChild: () => {},
@@ -61,7 +62,7 @@ function loadTerminal(opts = {}) {
     dispose: () => {},
     write: (data) => { termWriteMessages.push(data); },
     focus: () => { focusCallCount++; },
-    attachCustomKeyEventHandler: () => {},
+    attachCustomKeyEventHandler: (fn) => { capturedKeyHandler = fn; },
     getSelection: () => '',
     onSelectionChange: (fn) => { capturedSelectionChange = fn; },
     parser: {
@@ -183,6 +184,7 @@ function loadTerminal(opts = {}) {
     get capturedTermOptions() { return capturedTermOptions; },
     get containerListeners() { return containerListeners; },
     get csiHandlers() { return csiHandlers; },
+    get capturedKeyHandler() { return capturedKeyHandler; },
     fireSelectionChange() { if (capturedSelectionChange) capturedSelectionChange(); },
     mockTerm,
     fireClose() { if (capturedCloseHandler) capturedCloseHandler(); },
@@ -1307,11 +1309,6 @@ test('empty OSC 52 payload never clears the clipboard', async () => {
   assert.strictEqual(t.toasts.length, 0);
 });
 
-test('Terminal is created with macOptionClickForcesSelection (Option+drag = native selection on macOS)', () => {
-  const t = openForClipboardTest();
-  assert.strictEqual(t.capturedTermOptions.macOptionClickForcesSelection, true);
-});
-
 // --- Native selection under tmux `mouse on` (drag highlight must survive release) ---
 
 function decset(t, final) {
@@ -1402,4 +1399,31 @@ test('Cmd+C copy event with a selection shows the "Copied N chars" toast', () =>
   t.mockTerm.hasSelection = () => false;
   onCopy({});
   assert.deepStrictEqual(t.toasts, ['Copied 5 chars']);
+});
+
+// --- Keyboard contract for copy (Cmd+C / Ctrl+Shift+C) vs Ctrl+C (SIGINT) ---
+
+function keydown(props) {
+  return { type: 'keydown', ctrlKey: false, shiftKey: false, metaKey: false, altKey: false, ...props };
+}
+
+test('Ctrl+C is not intercepted — it still reaches the pane as ^C (SIGINT)', () => {
+  const t = openForClipboardTest();
+  t.mockTerm.getSelection = () => 'selected text';
+  assert.strictEqual(t.capturedKeyHandler(keydown({ ctrlKey: true, key: 'c', code: 'KeyC' })), true,
+    'xterm must process plain Ctrl+C even while text is selected');
+});
+
+test('Cmd+C is left to the browser so xterm.js serves the native copy event', () => {
+  const t = openForClipboardTest();
+  assert.strictEqual(t.capturedKeyHandler(keydown({ metaKey: true, key: 'c', code: 'KeyC' })), true);
+});
+
+test('Ctrl+Shift+C copies the selection explicitly (with toast) and is not sent to the pane', async () => {
+  const t = openForClipboardTest();
+  t.mockTerm.getSelection = () => 'selected text';
+  assert.strictEqual(t.capturedKeyHandler(keydown({ ctrlKey: true, shiftKey: true, key: 'C', code: 'KeyC' })), false);
+  await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(t.clipboardWrites, ['selected text']);
+  assert.deepStrictEqual(t.toasts, ['Copied 13 chars']);
 });
