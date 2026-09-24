@@ -63,6 +63,17 @@ consumers in ways this repo's tests won't catch:
   follows the active *selection*; this one follows the view *definitions*
   (membership data) themselves.
 
+- **Terminal mouse: native selection vs app passthrough** (`frontend/terminal.js`).
+  tmux `mouse on` asks the browser terminal for mouse tracking; the PWA does
+  NOT apply it by default, so drags are native xterm.js selections (persist,
+  Cmd+C copies) and only the wheel is forwarded to tmux as SGR reports. When
+  `GET /api/windows` reports `mouse_any: true` for the viewed session's active
+  window (its app tracks the mouse itself — e.g. fullscreen Claude Code's
+  clickable agent roster and its own copy-on-select via OSC 52), the PWA
+  replays tmux's tracking request into xterm so clicks/drags/wheel reach the
+  app. `mouse_any` is additive; older clients ignore it, and a missing field
+  means native. Local sessions only (no federation data in `/api/windows`).
+
 Preferred direction as semantics grow: move resolution **server-side** (e.g. a
 resolved-current-view endpoint) rather than expecting each client to port more
 logic — duplication across PWA/sidecar/agents is where drift bugs come from.

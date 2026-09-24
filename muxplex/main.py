@@ -912,9 +912,12 @@ async def get_windows() -> dict[str, list[dict]]:
     """Return all tmux windows grouped by session name (window-tree sidebar).
 
     Each entry is {"index": int, "name": str, "active": bool, "task": str,
-    "state": str}. ``state`` is the window's live ``@fstate`` fleet option so
-    the sidebar can render a per-window activity icon (working / reply_ready /
-    needs_attention / idle).
+    "state": str, "parent": str, "group": str, "mouse_any": bool}. ``state``
+    is the window's live ``@fstate`` fleet option so the sidebar can render a
+    per-window activity icon (working / reply_ready / needs_attention / idle).
+    ``mouse_any`` is the active pane's ``#{mouse_any_flag}`` — True while its
+    app has mouse tracking on (e.g. fullscreen Claude Code); the PWA terminal
+    then passes clicks through instead of doing a native text selection.
 
     Reuses the same tmux subprocess path as the rest of muxplex and is served
     by the local viewer app (no new network surface).

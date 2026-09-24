@@ -30,6 +30,26 @@ function _encodePayload(typeChar, str) {
   return payload;
 }
 
+// Both xterm's OSC 8 link handler and xterm-addon-web-links receive terminal
+// output as untrusted input, so they share one activation path (ported from
+// upstream muxplex): http(s) only, and the new tab never gets window.opener.
+function _termActivateExternalLink(uri) {
+  var parsed;
+  try {
+    parsed = new URL(uri);
+  } catch (_) {
+    return;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return;
+  }
+  var linkWindow = window.open('', '_blank');
+  if (linkWindow) {
+    linkWindow.opener = null;
+    linkWindow.location.href = parsed.href;
+  }
+}
+
 // ─── Clipboard helpers ───────────────────────────────────────────────────────
 // Ctrl+Shift+C: copy terminal selection to system clipboard
 // Ctrl+Shift+V: handled natively by xterm.js (browser paste event → xterm → WebSocket)
@@ -77,15 +97,22 @@ function _copyToClipboard(text) {
 // If xterm.js honors it, every drag becomes a tmux copy-mode selection that is
 // cancelled on release (copy-*-and-cancel) — the highlight vanishes the moment
 // the button comes up, and keeping it (copy-pipe-no-clear) leaves the pane in
-// copy-mode so typing stops reaching the app. Instead we swallow the tracking
-// request: drags stay native xterm.js selections (highlight persists until the
-// next click, copied with Cmd+C), and only the wheel is forwarded to the app
-// as SGR mouse reports, so tmux's WheelUpPane/copy-mode scrolling keeps working.
-// Trade-off: plain clicks no longer reach tmux (pane/status-bar clicks, tmux's
-// right-click menu, mouse input for TUIs inside the pane).
+// copy-mode so typing stops reaching the app. So by default we swallow the
+// tracking request: drags stay native xterm.js selections (highlight persists
+// until the next click, copied with Cmd+C), and only the wheel is forwarded to
+// tmux as SGR mouse reports, so tmux's WheelUpPane/copy-mode scrolling works.
+//
+// App passthrough: when the app in the viewed window has mouse tracking on
+// itself (tmux #{mouse_any_flag}, e.g. fullscreen Claude Code — its agent
+// roster is clickable and it does its own drag-select + OSC 52 copy), app.js
+// calls setTerminalAppMouse(true) from the GET /api/windows `mouse_any` field
+// and we apply tmux's tracking request to xterm after all, so clicks, drags
+// and the wheel reach the app through tmux unchanged.
 var _MOUSE_TRACKING_MODES = [9, 1000, 1001, 1002, 1003];
-var _WHEEL_STEP_PX = 50;      // accumulated pixel delta per forwarded wheel notch
-var _appMouseTracking = false; // app asked for tracking we did not hand to xterm
+var _WHEEL_STEP_PX = 50;       // accumulated pixel delta per forwarded wheel notch
+var _tmuxTrackingModes = {};   // tracking modes tmux currently asks for
+var _mousePassthrough = false; // app in the viewed window wants the mouse
+var _localDecsetWrites = 0;    // our own DECSET writes in flight (not tmux's)
 var _wheelAccum = 0;
 
 function _decsetModes(params) {
@@ -98,6 +125,10 @@ function _decsetModes(params) {
 
 function _isTrackingMode(m) {
   return _MOUSE_TRACKING_MODES.indexOf(m) !== -1;
+}
+
+function _tmuxWantsMouse() {
+  return Object.keys(_tmuxTrackingModes).length > 0;
 }
 
 // Forward one wheel notch to the app as an SGR mouse report (button 64 = up,
@@ -118,21 +149,50 @@ function _sendWheelReport(e, dir) {
   _ws.send(_encodePayload(0x30, '\x1b[<' + (dir < 0 ? 64 : 65) + ';' + col + ';' + row + 'M'));
 }
 
+/**
+ * Switch between native selection (false) and app mouse passthrough (true).
+ * Replays tmux's current tracking request into xterm (DECSET h/l) so the
+ * change takes effect immediately, without waiting for tmux to resend it.
+ */
+function setTerminalAppMouse(on) {
+  on = !!on;
+  if (on === _mousePassthrough) return;
+  _mousePassthrough = on;
+  if (!_term) return;
+  var modes = Object.keys(_tmuxTrackingModes);
+  if (!modes.length) return;
+  if (on && _term.clearSelection) _term.clearSelection();
+  var seq = modes.map(function(m) { return '\x1b[?' + m + (on ? 'h' : 'l'); }).join('');
+  _localDecsetWrites++;
+  _term.write(seq, function() { _localDecsetWrites--; });
+}
+
+window.setTerminalAppMouse = setTerminalAppMouse;
+
 function _installNativeSelection(term, container) {
-  _appMouseTracking = false;
+  // A new terminal starts native; app.js re-asserts passthrough on its next
+  // /api/windows poll. tmux re-sends its tracking request on attach.
+  _tmuxTrackingModes = {};
+  _mousePassthrough = false;
+  _localDecsetWrites = 0;
   _wheelAccum = 0;
 
-  // Swallow DECSET of tracking modes (tmux sends each mode as its own
-  // sequence). A mixed sequence falls through to xterm unchanged.
+  // tmux sends each DECSET mode as its own sequence; a mixed sequence falls
+  // through to xterm unchanged. Our own replays (setTerminalAppMouse) always
+  // apply and never touch the record of what tmux asked for.
   term.parser.registerCsiHandler({ prefix: '?', final: 'h' }, function(params) {
     var modes = _decsetModes(params);
     var tracking = modes.filter(_isTrackingMode);
-    if (!tracking.length) return false;
-    _appMouseTracking = true;
+    if (!tracking.length || _localDecsetWrites > 0) return false;
+    tracking.forEach(function(m) { _tmuxTrackingModes[m] = true; });
+    if (_mousePassthrough) return false;
     return tracking.length === modes.length;
   });
   term.parser.registerCsiHandler({ prefix: '?', final: 'l' }, function(params) {
-    if (_decsetModes(params).some(_isTrackingMode)) _appMouseTracking = false;
+    if (_localDecsetWrites > 0) return false;
+    _decsetModes(params).filter(_isTrackingMode).forEach(function(m) {
+      delete _tmuxTrackingModes[m];
+    });
     return false;
   });
 
@@ -151,8 +211,9 @@ function _installNativeSelection(term, container) {
 
   // Capture phase: runs before xterm's own wheel handler (which, with no
   // tracking on the alternate screen, would turn the wheel into arrow keys).
+  // In passthrough xterm is tracking itself and reports the wheel to tmux.
   container.addEventListener('wheel', function(e) {
-    if (!_term || !_appMouseTracking) return;
+    if (!_term || _mousePassthrough || !_tmuxWantsMouse()) return;
     e.preventDefault();
     e.stopPropagation();
     var px = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1);
@@ -367,6 +428,15 @@ function createTerminal(fontSize) {
     },
     scrollback: mobile ? 500 : 5000,
     allowProposedApi: true,
+    // OSC 8 hyperlinks (e.g. Claude Code's Markdown link labels; needs tmux
+    // `terminal-features ',xterm*:hyperlinks'` or tmux strips them). Without a
+    // handler xterm.js falls back to a confirm() prompt. Same gesture as the
+    // plain-URL addon below: Cmd/Ctrl+click opens, a plain click stays a click.
+    linkHandler: {
+      activate: function(event, uri) {
+        if (event.ctrlKey || event.metaKey) _termActivateExternalLink(uri);
+      },
+    },
   });
 
   _fitAddon = new window.FitAddon.FitAddon();
@@ -379,7 +449,7 @@ function createTerminal(fontSize) {
   if (WebLinksAddon) {
     _term.loadAddon(new WebLinksAddon(function(event, uri) {
       if (event.ctrlKey || event.metaKey) {
-        window.open(uri, '_blank');
+        _termActivateExternalLink(uri);
       }
     }));
   }

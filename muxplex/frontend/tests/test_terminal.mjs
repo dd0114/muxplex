@@ -60,7 +60,7 @@ function loadTerminal(opts = {}) {
     onResize: (fn) => { onResizeCallCount++; capturedOnResizeFn = fn; },
     loadAddon: () => {},
     dispose: () => {},
-    write: (data) => { termWriteMessages.push(data); },
+    write: (data, cb) => { termWriteMessages.push(data); if (cb) cb(); },
     focus: () => { focusCallCount++; },
     attachCustomKeyEventHandler: (fn) => { capturedKeyHandler = fn; },
     getSelection: () => '',
@@ -1436,4 +1436,93 @@ test('mousedown is never intercepted — xterm.js focuses its textarea on the re
   const t = openForClipboardTest();
   const intercepted = t.containerListeners.filter((l) => ['mousedown', 'mouseup', 'mousemove', 'click'].includes(l.ev));
   assert.deepStrictEqual(intercepted, [], 'no mouse button listeners on the terminal container');
+});
+
+// --- App mouse passthrough (fullscreen Claude Code: clickable roster, own drag-copy) ---
+
+test('setTerminalAppMouse(true) replays tmux tracking into xterm so clicks reach the app', () => {
+  const t = openForClipboardTest();
+  const set = decset(t, 'h');
+  assert.strictEqual(set([1002]), true, 'native by default: tmux tracking swallowed');
+  const before = t.termWriteMessages.length;
+  globalThis.window.setTerminalAppMouse(true);
+  assert.deepStrictEqual(t.termWriteMessages.slice(before), ['\x1b[?1002h']);
+  assert.strictEqual(set([1002]), false, 'in passthrough a tmux resend is applied too');
+});
+
+test('setTerminalAppMouse(false) turns xterm tracking back off and restores native selection', () => {
+  const t = openForClipboardTest();
+  decset(t, 'h')([1002]);
+  globalThis.window.setTerminalAppMouse(true);
+  const before = t.termWriteMessages.length;
+  globalThis.window.setTerminalAppMouse(false);
+  assert.deepStrictEqual(t.termWriteMessages.slice(before), ['\x1b[?1002l']);
+  assert.strictEqual(decset(t, 'h')([1002]), true, 'back to swallowing');
+});
+
+test('our own DECSET replays never change the record of what tmux asked for', () => {
+  const t = openForClipboardTest();
+  const set = decset(t, 'h'); const reset = decset(t, 'l');
+  set([1002]);
+  // Simulate the replay being parsed while in flight: mock write() is sync, so
+  // drive the handlers the way xterm would during our own write.
+  const origWrite = t.mockTerm.write;
+  t.mockTerm.write = (data, cb) => { reset([1002]); if (cb) cb(); };
+  globalThis.window.setTerminalAppMouse(true);
+  globalThis.window.setTerminalAppMouse(false);
+  t.mockTerm.write = origWrite;
+  // tmux still wants tracking → native wheel forwarding stays active
+  t.mockTerm.element = { querySelector: () => null };
+  const ev = fakeWheel(-100);
+  wheelListener(t)(ev);
+  assert.strictEqual(ev.defaultPrevented, true);
+});
+
+test('in passthrough the wheel is left to xterm (it reports to tmux itself)', () => {
+  const t = openForClipboardTest();
+  decset(t, 'h')([1002]);
+  globalThis.window.setTerminalAppMouse(true);
+  const ev = fakeWheel(-100);
+  wheelListener(t)(ev);
+  assert.strictEqual(ev.defaultPrevented, false);
+  globalThis.window.setTerminalAppMouse(false);
+});
+
+test('a new terminal starts native even if the previous one was in passthrough', () => {
+  const t = openForClipboardTest();
+  decset(t, 'h')([1002]);
+  globalThis.window.setTerminalAppMouse(true);
+  const orig = globalThis.setTimeout;
+  globalThis.setTimeout = (_fn, _ms) => 0;
+  t.openTerminal('another');
+  globalThis.setTimeout = orig;
+  const set = t.csiHandlers.filter((h) => h.id.final === 'h').pop().handler;
+  assert.strictEqual(set([1002]), true);
+});
+
+// --- Links: OSC 8 (Claude Code Markdown labels) + plain URLs share one safe opener ---
+
+function captureOpen() {
+  const opened = [];
+  globalThis.window.open = (url, target) => {
+    const w = { opener: 'parent', location: { set href(v) { opened.push({ href: v, target, opener: w.opener }); } } };
+    return w;
+  };
+  return opened;
+}
+
+test('OSC 8 link: Cmd/Ctrl+click opens http(s) in a new tab with no opener; plain click does not', () => {
+  const t = openForClipboardTest();
+  const handler = t.capturedTermOptions.linkHandler;
+  assert.ok(handler && typeof handler.activate === 'function', 'linkHandler must be set (else xterm shows confirm())');
+  const opened = captureOpen();
+  handler.activate({ metaKey: true }, 'http://localhost:18101/x');
+  handler.activate({ ctrlKey: true }, 'https://example.com/');
+  handler.activate({}, 'http://localhost:18101/plain-click');
+  handler.activate({ metaKey: true }, 'javascript:alert(1)');
+  handler.activate({ metaKey: true }, 'file:///etc/passwd');
+  assert.deepStrictEqual(opened, [
+    { href: 'http://localhost:18101/x', target: '_blank', opener: null },
+    { href: 'https://example.com/', target: '_blank', opener: null },
+  ]);
 });

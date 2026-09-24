@@ -7343,3 +7343,42 @@ test('a view-membership toggle through _saveViewsAndRerender produces the correc
 
   globalThis.fetch = undefined;
 });
+
+// --- syncTerminalAppMouse: GET /api/windows `mouse_any` → terminal click passthrough ---
+
+function captureAppMouse() {
+  const calls = [];
+  globalThis.window.setTerminalAppMouse = (on) => { calls.push(on); };
+  return calls;
+}
+
+test('syncTerminalAppMouse passes clicks through when the viewed window app tracks the mouse', () => {
+  const calls = captureAppMouse();
+  app._setViewingSession('root');
+  app._setViewingRemoteId('');
+  app._setWindowsBySession({
+    root: [
+      { index: 0, name: 'hub', active: false, mouse_any: false },
+      { index: 1, name: 'claude', active: true, mouse_any: true },
+    ],
+  });
+  app.syncTerminalAppMouse();
+  assert.deepEqual(calls, [true]);
+});
+
+test('syncTerminalAppMouse stays native for a plain shell window, missing data, remotes, or the grid', () => {
+  const calls = captureAppMouse();
+  app._setViewingRemoteId('');
+  app._setViewingSession('root');
+  app._setWindowsBySession({ root: [{ index: 0, name: 'sh', active: true, mouse_any: false }] });
+  app.syncTerminalAppMouse();
+  app._setWindowsBySession({ root: [{ index: 0, name: 'sh', active: true }] }); // older server: no field
+  app.syncTerminalAppMouse();
+  app._setWindowsBySession({ root: [{ index: 0, name: 'claude', active: true, mouse_any: true }] });
+  app._setViewingRemoteId('peer-1'); // federation: /api/windows is local-only
+  app.syncTerminalAppMouse();
+  app._setViewingRemoteId('');
+  app._setViewingSession(null); // grid view
+  app.syncTerminalAppMouse();
+  assert.deepEqual(calls, [false, false, false, false]);
+});
