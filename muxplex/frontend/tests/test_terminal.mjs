@@ -1427,3 +1427,13 @@ test('Ctrl+Shift+C copies the selection explicitly (with toast) and is not sent 
   assert.deepStrictEqual(t.clipboardWrites, ['selected text']);
   assert.deepStrictEqual(t.toasts, ['Copied 13 chars']);
 });
+
+test('mousedown is never intercepted — xterm.js focuses its textarea on the real mousedown', () => {
+  // Regression guard: an earlier attempt re-dispatched a synthetic mousedown
+  // (stopPropagation + modifier keys) to force selection, which skipped
+  // xterm's own focus() and broke keyboard input after a click. Native
+  // selection must come from the DECSET swallow, not from rewriting clicks.
+  const t = openForClipboardTest();
+  const intercepted = t.containerListeners.filter((l) => ['mousedown', 'mouseup', 'mousemove', 'click'].includes(l.ev));
+  assert.deepStrictEqual(intercepted, [], 'no mouse button listeners on the terminal container');
+});
