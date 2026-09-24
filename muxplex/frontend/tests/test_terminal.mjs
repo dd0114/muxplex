@@ -988,11 +988,17 @@ test('_setTerminalFontSize sets _term.options.fontSize and calls _fitAddon.fit()
 
 // --- Clipboard Issue 1: auto-copy mouse selection via onSelectionChange ---
 
-test('terminal.js auto-copies mouse selection to clipboard via onSelectionChange', () => {
+test('terminal.js copies a selection on explicit copy (Cmd+C copy event), not on selection change', () => {
+  // Behavior-level coverage: see 'selecting text does not auto-copy' and
+  // 'Cmd+C copy event ... toast' below. Here: the copy listener is wired.
   const source = fs.readFileSync(new URL('../terminal.js', import.meta.url), 'utf8');
   assert.ok(
-    source.includes('onSelectionChange'),
-    'must register onSelectionChange handler to auto-copy mouse selection to clipboard',
+    source.includes("container.addEventListener('copy'"),
+    'must listen for the browser copy event (Cmd+C) on the terminal container',
+  );
+  assert.ok(
+    !source.includes('onSelectionChange'),
+    'selection must not auto-copy — drag selects, Cmd+C copies',
   );
 });
 
@@ -1379,14 +1385,21 @@ test('container listeners are bound once across session switches', () => {
   assert.strictEqual(t.containerListeners.filter((l) => l.ev === 'wheel').length, 1);
 });
 
-test('auto-copy skips jitter selections (<2 non-space chars) so a click cannot clobber the clipboard', async () => {
+test('selecting text does not auto-copy (drag selects, Cmd+C copies)', async () => {
   const t = openForClipboardTest();
-  for (const sel of ['─', 'a ', '   ', 'e']) {
-    t.mockTerm.getSelection = () => sel;
-    t.fireSelectionChange();
-  }
-  t.mockTerm.getSelection = () => 'ls';
+  t.mockTerm.getSelection = () => 'line38 alpha';
   t.fireSelectionChange();
   await new Promise((r) => setImmediate(r));
-  assert.deepStrictEqual(t.clipboardWrites, ['ls']);
+  assert.strictEqual(t.clipboardWrites.length, 0, 'selection alone must not touch the clipboard');
+});
+
+test('Cmd+C copy event with a selection shows the "Copied N chars" toast', () => {
+  const t = openForClipboardTest();
+  const onCopy = t.containerListeners.find((l) => l.ev === 'copy').fn;
+  t.mockTerm.hasSelection = () => true;
+  t.mockTerm.getSelection = () => '두고 비교';
+  onCopy({});
+  t.mockTerm.hasSelection = () => false;
+  onCopy({});
+  assert.deepStrictEqual(t.toasts, ['Copied 5 chars']);
 });

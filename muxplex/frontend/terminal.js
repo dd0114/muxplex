@@ -78,8 +78,8 @@ function _copyToClipboard(text) {
 // cancelled on release (copy-*-and-cancel) — the highlight vanishes the moment
 // the button comes up, and keeping it (copy-pipe-no-clear) leaves the pane in
 // copy-mode so typing stops reaching the app. Instead we swallow the tracking
-// request: drags stay native xterm.js selections (highlight persists, copied by
-// the onSelectionChange auto-copy), and only the wheel is forwarded to the app
+// request: drags stay native xterm.js selections (highlight persists until the
+// next click, copied with Cmd+C), and only the wheel is forwarded to the app
 // as SGR mouse reports, so tmux's WheelUpPane/copy-mode scrolling keeps working.
 // Trade-off: plain clicks no longer reach tmux (pane/status-bar clicks, tmux's
 // right-click menu, mouse input for TUIs inside the pane).
@@ -140,6 +140,14 @@ function _installNativeSelection(term, container) {
   // for every session, and they read the module-level _term/_ws.
   if (container._muxplexNativeSelection) return;
   container._muxplexNativeSelection = true;
+
+  // Cmd+C: xterm.js fills the clipboard from its own 'copy' handler on the
+  // focused textarea; this bubble-phase listener only confirms it.
+  container.addEventListener('copy', function() {
+    if (!_term || !_term.hasSelection()) return;
+    var sel = _term.getSelection();
+    if (sel) _notifyCopy('Copied ' + Array.from(sel).length + ' chars');
+  });
 
   // Capture phase: runs before xterm's own wheel handler (which, with no
   // tracking on the alternate screen, would turn the wheel into arrow keys).
@@ -509,20 +517,10 @@ function openTerminal(sessionName, remoteId, fontSize) {
     return true;  // let xterm handle all other keys normally
   });
 
-  // Auto-copy: when mouse selection ends, copy to system clipboard.
-  // Matches terminal emulator conventions (iTerm2, WezTerm, ttyd native).
-  // onSelectionChange fires whenever selection changes — copy if text is selected.
-  // When selection is cleared (empty string), we skip the clipboard write.
-  // Selections under 2 non-space chars are skipped: a click whose pointer
-  // jitters across a cell boundary (e.g. clicking the input line before Cmd+V)
-  // selects a stray "─" or blank and would overwrite what was just copied.
-  // Ctrl+Shift+C still copies any selection explicitly.
-  _term.onSelectionChange(function() {
-    var sel = _term.getSelection();
-    if (sel && sel.trim().length >= 2) {
-      _copyToClipboard(sel);
-    }
-  });
+  // No auto-copy on selection: like any other app, a drag selects and
+  // Cmd+C (macOS) / Ctrl+Shift+C copies. xterm.js serves the browser's copy
+  // event from its focused textarea; see the 'copy' listener in
+  // _installNativeSelection for the confirmation toast.
 
   _installNativeSelection(_term, container);
 

@@ -21,8 +21,8 @@
 ### Terminal
 
 - **Full interactive terminal** — powered by xterm.js + ttyd
-- **Native clipboard** — Ctrl+Shift+C to copy, Cmd+V (macOS) / Ctrl+Shift+V (Linux) to paste
-- **Mouse select auto-copy** — selecting text copies to system clipboard on release
+- **Native clipboard** — Cmd+C (macOS) / Ctrl+Shift+C to copy, Cmd+V (macOS) / Ctrl+Shift+V (Linux) to paste
+- **Mouse select** — drag selects text like any app (the highlight stays, even with tmux `mouse on`); copy it with Cmd+C / Ctrl+Shift+C. The mouse wheel still drives tmux scrollback
 - **OSC 52 tmux clipboard bridge** — tmux copy mode selections go to system clipboard
 - **Search** — Ctrl+F opens a search bar to find text in terminal scrollback (xterm-addon-search)
 - **Clickable URLs** — Ctrl+Click (Cmd+Click on macOS) opens URLs in terminal output in a new tab (xterm-addon-web-links)
@@ -354,7 +354,7 @@ All settings are stored in `~/.config/muxplex/settings.json`.
 
 | Shortcut | Action |
 |---|---|
-| Ctrl+Shift+C | Copy terminal selection to system clipboard |
+| Cmd+C / Ctrl+Shift+C | Copy terminal selection to system clipboard |
 | Cmd+V / Ctrl+Shift+V | Paste from system clipboard (native browser paste) |
 | Ctrl+F | Open terminal search bar |
 | Enter / Shift+Enter | Next / previous search match |
@@ -362,7 +362,9 @@ All settings are stored in `~/.config/muxplex/settings.json`.
 | `,` (comma) | Open settings |
 | Escape | Close settings / return to dashboard |
 
-Mouse select in the terminal auto-copies to the system clipboard on release.
+Dragging in the terminal selects text and the selection stays after release, even with tmux `mouse on`
+(muxplex keeps drags as browser-side selections and forwards only the wheel to tmux). Copy with Cmd+C /
+Ctrl+Shift+C; nothing is copied until you ask.
 
 ---
 
