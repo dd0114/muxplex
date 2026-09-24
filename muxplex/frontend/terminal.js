@@ -435,6 +435,18 @@ function openTerminal(sessionName, remoteId, fontSize) {
     }
   });
 
+  // Forced selection (Option+drag on macOS, Shift+drag elsewhere) while the
+  // app has mouse tracking on (tmux `mouse on`): xterm.js still reports the
+  // mouseup to the app, and that reported input clears the selection before
+  // the user can copy it. Capture phase on the container runs before xterm's
+  // own listeners, so the selection is still intact here — copy it now.
+  container.addEventListener('mouseup', function() {
+    if (!_term || !_term.modes || _term.modes.mouseTrackingMode === 'none') return;
+    if (!_term.hasSelection()) return;
+    var sel = _term.getSelection();
+    if (sel) _copyToClipboard(sel);
+  }, true);
+
   // OSC 52 clipboard integration — bridges tmux clipboard to the browser.
   // When tmux copies text (with `set-clipboard on` in .tmux.conf), it sends
   // an OSC 52 escape sequence to the terminal. xterm.js surfaces this via the

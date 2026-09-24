@@ -35,6 +35,7 @@ function loadTerminal(opts = {}) {
   let clipboardWrites = [];
   let toasts = [];
   let capturedTermOptions = null;
+  let containerListeners = [];
 
   let capturedWsUrl = null;
   let onDataCallCount = 0;
@@ -92,7 +93,10 @@ function loadTerminal(opts = {}) {
   globalThis.location = { protocol: 'http:', host: 'localhost' };
   globalThis.document = {
     getElementById: (id) => {
-      if (id === 'terminal-container') return { appendChild: () => {}, addEventListener: () => {} };
+      if (id === 'terminal-container') return {
+        appendChild: () => {},
+        addEventListener: (ev, fn, capture) => { containerListeners.push({ ev, fn, capture: !!capture }); },
+      };
       if (id === 'reconnect-overlay') return { classList: { add: () => {}, remove: () => {} } };
       return null;
     },
@@ -170,6 +174,8 @@ function loadTerminal(opts = {}) {
     get clipboardWrites() { return clipboardWrites; },
     get toasts() { return toasts; },
     get capturedTermOptions() { return capturedTermOptions; },
+    get containerListeners() { return containerListeners; },
+    mockTerm,
     fireClose() { if (capturedCloseHandler) capturedCloseHandler(); },
     fireOpen() { if (lastOpenHandler) lastOpenHandler(); },
     fireOsc52(base64Payload) {
@@ -1289,4 +1295,32 @@ test('empty OSC 52 payload never clears the clipboard', async () => {
 test('Terminal is created with macOptionClickForcesSelection (Option+drag = native selection on macOS)', () => {
   const t = openForClipboardTest();
   assert.strictEqual(t.capturedTermOptions.macOptionClickForcesSelection, true);
+});
+
+test('forced selection under mouse tracking is copied on mouseup (capture phase, before xterm clears it)', async () => {
+  const t = openForClipboardTest();
+  const mouseups = t.containerListeners.filter((l) => l.ev === 'mouseup' && l.capture);
+  assert.strictEqual(mouseups.length, 1, 'must register exactly one capture-phase mouseup listener');
+
+  // tmux `mouse on` → xterm mouse tracking active, Option+drag left a selection
+  t.mockTerm.modes = { mouseTrackingMode: 'drag' };
+  t.mockTerm.hasSelection = () => true;
+  t.mockTerm.getSelection = () => 'line38 alpha';
+  mouseups[0].fn({});
+  await new Promise((r) => setImmediate(r));
+  assert.deepStrictEqual(t.clipboardWrites, ['line38 alpha']);
+});
+
+test('mouseup copy is a no-op without mouse tracking (onSelectionChange already covers it)', async () => {
+  const t = openForClipboardTest();
+  const mouseup = t.containerListeners.find((l) => l.ev === 'mouseup' && l.capture);
+  t.mockTerm.modes = { mouseTrackingMode: 'none' };
+  t.mockTerm.hasSelection = () => true;
+  t.mockTerm.getSelection = () => 'x';
+  mouseup.fn({});
+  t.mockTerm.modes = { mouseTrackingMode: 'drag' };
+  t.mockTerm.hasSelection = () => false;
+  mouseup.fn({});
+  await new Promise((r) => setImmediate(r));
+  assert.strictEqual(t.clipboardWrites.length, 0);
 });
