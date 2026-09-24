@@ -338,6 +338,10 @@ _WINDOW_FORMAT = _WINDOW_FIELD_SEP.join(
         "#{@fstate}",  # fleet live state; '' when unset (see FLEET_STATES)
         "#{@parent}",  # declared parent window name (tree nesting); '' when unset
         "#{@group}",  # declared horizontal group name (tree folder); '' when unset
+        # 1 when the window's active pane app has mouse tracking on (e.g.
+        # fullscreen Claude Code) — the browser terminal then passes clicks
+        # through to tmux instead of doing a native text selection.
+        "#{mouse_any_flag}",
     ]
 )
 
@@ -354,11 +358,16 @@ async def list_windows() -> dict[str, list[dict]]:
     Runs ``tmux list-windows -a -F <format>`` (one call, all sessions) and
     parses each tab-delimited line into a dict:
         {"index": int, "name": str, "active": bool, "task": str, "state": str,
-         "parent": str, "group": str}
+         "parent": str, "group": str, "mouse_any": bool}
 
     ``parent``/``group`` are the declared tree options (``@parent`` nests a
     window under the named window; ``@group`` collects windows under a folder);
     both are '' when unset.
+
+    ``mouse_any`` is the active pane's ``#{mouse_any_flag}``: True while the
+    app in that pane has mouse tracking on (e.g. fullscreen Claude Code). The
+    browser terminal uses it to pass clicks through to the app; everywhere
+    else drags stay native text selections. False when unknown.
 
     ``state`` is the window's live ``@fstate`` fleet option (see FLEET_STATES);
     '' when the hook has never fired for that window. Because it is read from
@@ -380,7 +389,7 @@ async def list_windows() -> dict[str, list[dict]]:
         # and @group are the trailing quartet. A tab cannot appear in a tmux
         # window/session name, and the trailing option values are names from a
         # controlled vocabulary, so positional splitting is safe.
-        parts = line.split(_WINDOW_FIELD_SEP, 7)
+        parts = line.split(_WINDOW_FIELD_SEP, 8)
         if len(parts) < 4:
             continue
         session_name, index_str, win_name, active_str = parts[:4]
@@ -388,6 +397,7 @@ async def list_windows() -> dict[str, list[dict]]:
         state = parts[5] if len(parts) > 5 else ""
         parent = parts[6] if len(parts) > 6 else ""
         group = parts[7] if len(parts) > 7 else ""
+        mouse_any = len(parts) > 8 and parts[8] == "1"
         try:
             index = int(index_str)
         except ValueError:
@@ -401,6 +411,7 @@ async def list_windows() -> dict[str, list[dict]]:
                 "state": state if state in FLEET_STATES else "",
                 "parent": parent,
                 "group": group,
+                "mouse_any": mouse_any,
             }
         )
     return windows

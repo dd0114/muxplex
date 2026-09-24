@@ -522,6 +522,7 @@ async def test_list_windows_parses_fstate_into_state_field(mock_subprocess):
         "state": "working",
         "parent": "",
         "group": "",
+        "mouse_any": False,
     }
     assert windows["hmb"][1]["state"] == "reply_ready"
 
@@ -564,3 +565,29 @@ async def test_list_windows_missing_parent_group_fields_default_empty(mock_subpr
         windows = await list_windows()
     assert windows["s"][0]["parent"] == ""
     assert windows["s"][0]["group"] == ""
+
+
+async def test_list_windows_parses_mouse_any_flag(mock_subprocess):
+    """mouse_any reflects the active pane's #{mouse_any_flag} (fullscreen app)."""
+    line1 = TAB.join(["s", "0", "claude", "1", "", "", "", "", "1"])
+    line2 = TAB.join(["s", "1", "shell", "0", "", "", "", "", "0"])
+    with mock_subprocess(stdout=line1 + "\n" + line2 + "\n"):
+        windows = await list_windows()
+    assert windows["s"][0]["mouse_any"] is True
+    assert windows["s"][1]["mouse_any"] is False
+
+
+async def test_list_windows_missing_mouse_any_defaults_false(mock_subprocess):
+    """Older output shapes (no 9th column) parse with mouse_any=False."""
+    line = TAB.join(["s", "0", "w", "1", "", "", "p", "g"])
+    with mock_subprocess(stdout=line + "\n"):
+        windows = await list_windows()
+    assert windows["s"][0]["mouse_any"] is False
+    assert windows["s"][0]["group"] == "g", "group must not swallow the new column"
+
+
+def test_window_format_requests_mouse_any_flag():
+    """The tmux format must ask for the active pane's mouse tracking flag."""
+    from muxplex.sessions import _WINDOW_FORMAT
+
+    assert _WINDOW_FORMAT.endswith("#{mouse_any_flag}")

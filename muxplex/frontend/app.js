@@ -465,6 +465,7 @@ async function pollSessions() {
     } catch (e) {
       _windowsBySession = _windowsBySession || {};
     }
+    syncTerminalAppMouse();
     _pollFailCount = 0;
     setConnectionStatus('ok');
     renderGrid(sessions);
@@ -3746,6 +3747,24 @@ async function openSession(name, opts = {}) {
 
   // Mount terminal NOW — /connect has completed, new ttyd is serving the correct session
   if (window._openTerminal) window._openTerminal(name, _deviceId, getDisplaySettings().fontSize);
+  syncTerminalAppMouse();
+}
+
+/**
+ * Tell the terminal whether the viewed window's app has mouse tracking on
+ * (GET /api/windows `mouse_any`, e.g. fullscreen Claude Code), so clicks pass
+ * through to it instead of starting a native text selection. Local sessions
+ * only — /api/windows has no federation data, so remotes stay native.
+ */
+function syncTerminalAppMouse() {
+  if (typeof window.setTerminalAppMouse !== 'function') return;
+  let on = false;
+  if (_viewingSession && !_viewingRemoteId) {
+    const wins = (_windowsBySession || {})[_viewingSession] || [];
+    const active = wins.find((w) => w.active);
+    on = !!(active && active.mouse_any);
+  }
+  window.setTerminalAppMouse(on);
 }
 
 /**
@@ -3805,6 +3824,11 @@ function _setViewingSession(name) {
  */
 function _setViewingRemoteId(remoteId) {
   _viewingRemoteId = remoteId;
+}
+
+/** Test-only setter for the GET /api/windows cache. */
+function _setWindowsBySession(windows) {
+  _windowsBySession = windows;
 }
 
 /**
@@ -5445,6 +5469,8 @@ if (typeof module !== 'undefined' && module.exports) {
     closeSession,
     _setViewingSession,
     _setViewingRemoteId,
+    _setWindowsBySession,
+    syncTerminalAppMouse,
     _setPendingLocalSwitches,
     handleGlobalKeydown,
     bindStaticEventListeners,
