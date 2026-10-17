@@ -32,7 +32,7 @@ _default_ttyd_pid_dir = Path.home() / ".local" / "share" / "tmux-web"
 TTYD_PID_DIR: Path = Path(os.environ.get("TMUX_WEB_STATE_DIR", _default_ttyd_pid_dir))
 TTYD_PID_PATH: Path = TTYD_PID_DIR / "ttyd.pid"
 
-TTYD_PORT: int = 7682
+TTYD_PORT: int = 7683  # fleet2: 7682 is the original fleet ttyd
 
 # ---------------------------------------------------------------------------
 # Module state
